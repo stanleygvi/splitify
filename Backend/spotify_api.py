@@ -7,6 +7,11 @@ SPOTIFY_API_URL = "https://api.spotify.com/v1"
 RECCOBEATS_API_URL = "https://api.reccobeats.com/v1"
 
 
+def get_spotify_redirect_uri() -> str:
+    app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+    return os.getenv("SPOTIFY_REDIRECT_URI", f"{app_base_url}/callback")
+
+
 def spotify_request(
     method, endpoint, auth_token, params=None, data=None, json_data=None
 ):
@@ -78,11 +83,16 @@ def refresh_access_token(refresh_token) -> str:
 def exchange_code_for_token(code):
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
+    redirect_uri = get_spotify_redirect_uri()
+    if not client_id or not client_secret or not redirect_uri:
+        print("Missing Spotify OAuth configuration (CLIENT_ID/CLIENT_SECRET/redirect_uri)")
+        return None
+
     url = "https://accounts.spotify.com/api/token"
     data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": "https://splitify-app-96607781f61f.herokuapp.com/callback",
+        "redirect_uri": redirect_uri,
         "client_id": client_id,
         "client_secret": client_secret,
     }
