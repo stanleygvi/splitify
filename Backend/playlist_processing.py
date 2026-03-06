@@ -1,7 +1,6 @@
 import asyncio
 import time
-from collections import Counter
-from threading import Lock
+from collections import defaultdict
 from Backend.spotify_api import (
     get_playlist_length,
     get_playlist_children,
@@ -9,9 +8,10 @@ from Backend.spotify_api import (
     add_songs,
     get_user_id,
     get_playlist_name,
-    get_artists,
+    get_reccobeats_audio_features,
 )
 from Backend.helpers import calc_slices
+from Backend.grouping import cluster_df
 
 
 def log_step_time(step_name, start_time):
@@ -19,172 +19,131 @@ def log_step_time(step_name, start_time):
     print(f"{step_name} completed in {elapsed_time:.2f} seconds.")
 
 
-async def fetch_genres(
-    artist_ids, track_id, auth_token, track_genres, genre_cache, genre_lock
-):
-    """Fetch genres for a given list of artist IDs and assign them to a track."""
-    try:
-        genres = set()
-        for artist_id in artist_ids:
-            if artist_id in genre_cache:
-                genres.update(genre_cache[artist_id])
-            else:
-                artist_genres = await get_artists([artist_id], auth_token)
-                genre_cache[artist_id] = artist_genres.get(artist_id, [])
-                genres.update(genre_cache[artist_id])
-
-        with genre_lock:
-            track_genres[track_id] = list(genres)
-    except Exception as e:
-        print(f"Error fetching genres for track {track_id}: {e}")
-
-
-async def assign_genres_to_tracks(auth_token, playlist_id):
-    """Assign genres to each track and return a mapping of track_id to genres."""
-    start_time = time.time()
+async def get_playlist_track_ids(auth_token, playlist_id):
+    """Return all track IDs from the playlist."""
     try:
         slices = calc_slices(get_playlist_length(playlist_id, auth_token))
-        track_genres = {}
-        genre_cache = {}
-        genre_lock = Lock()
+        track_ids = []
 
-        tasks = []
         for i in range(0, slices * 100, 100):
             response = await get_playlist_children(i, playlist_id, auth_token)
-            if response and "items" in response:
-                tracks = response["items"]
-                track_to_artists = {
-                    track["track"]["id"]: [
-                        artist["id"] for artist in track["track"]["artists"]
-                    ]
-                    for track in tracks
-                    if track["track"] and "artists" in track["track"]
-                }
-                for track_id, artist_ids in track_to_artists.items():
-                    tasks.append(
-                        fetch_genres(
-                            artist_ids,
-                            track_id,
-                            auth_token,
-                            track_genres,
-                            genre_cache,
-                            genre_lock,
-                        )
-                    )
+            if not response or "items" not in response:
+                continue
 
-        await asyncio.gather(*tasks)
-        log_step_time("Assigning genres to tracks", start_time)
-        return track_genres
+            for item in response["items"]:
+                track = item.get("track") or {}
+                track_id = track.get("id")
+                if track_id:
+                    track_ids.append(track_id)
+
+        return track_ids
     except Exception as e:
-        print(f"Error assigning genres to tracks: {e}")
-        return {}
-
-
-async def sort_genres_by_count(track_genres):
-    """Return a sorted list of genres by frequency in ascending order."""
-    start_time = time.time()
-    try:
-        genre_counter = Counter(
-            genre for genres in track_genres.values() for genre in genres
-        )
-        sorted_genres = sorted(genre_counter.items(), key=lambda x: x[1])
-        log_step_time("Sorting genres by count", start_time)
-        return sorted_genres
-    except Exception as e:
-        print(f"Error sorting genres: {e}")
+        print(f"Error getting playlist tracks for {playlist_id}: {e}")
         return []
 
 
-async def create_and_populate_single_genre_playlist(genre, genre_tracks, tracks_data, user_id, auth_token, playlist_name, used_tracks):
-    """Create and populate a single genre playlist."""
-    try:
-        playlist_id = await create_playlist(
-            user_id,
-            auth_token,
-            f"{playlist_name} - {genre}",
-            f"Split by subgenre: {genre}. Made using Splitify: https://splitifytool.com/",
-        )
+async def get_track_audio_features(track_ids, max_concurrency=8):
+    """Fetch audio features from ReccoBeats for each Spotify track ID."""
+    start_time = time.time()
+    semaphore = asyncio.Semaphore(max_concurrency)
+    features = []
 
-        slices = calc_slices(len(genre_tracks))
-        tasks = []
-        for position in range(0, slices * 100, 100):
-            track_slice = genre_tracks[position: position + 100]
-            track_uris = [f"spotify:track:{tracks_data[track_id]['uri']}" for track_id in track_slice]
-            tasks.append(add_songs(playlist_id, track_uris, auth_token, position))
+    async def fetch_single(track_id):
+        async with semaphore:
+            data = await asyncio.to_thread(get_reccobeats_audio_features, track_id)
+            if data:
+                features.append(data)
 
-        await asyncio.gather(*tasks)
+    tasks = [fetch_single(track_id) for track_id in track_ids]
+    await asyncio.gather(*tasks)
+    log_step_time("Fetching audio features", start_time)
+    return features
 
-        # Mark these tracks as used
-        used_tracks.update(genre_tracks)
-    except Exception as e:
-        print(f"Error creating or populating playlist for genre {genre}: {e}")
 
-async def create_and_populate_subgenre_playlists(
-    sorted_genres, track_genres, tracks_data, user_id, auth_token, playlist_name
+async def create_and_populate_cluster_playlists(
+    clustered_tracks, user_id, auth_token, playlist_name
 ):
-    """Create playlists divided by subgenre, prioritizing lower count genres first."""
+    """Create one playlist per K-means cluster and add grouped tracks."""
     start_time = time.time()
     try:
-        used_tracks = set()
-        tasks = []
+        tracks_by_cluster = defaultdict(list)
 
-        total_tracks = sum(len(genres) for genres in track_genres.values())
+        for _, row in clustered_tracks.iterrows():
+            tracks_by_cluster[int(row["cluster"])].append(row["id"])
 
-        for genre, _ in sorted_genres:
-            genre_tracks = [
-                track_id
-                for track_id, genres in track_genres.items()
-                if genre in genres and track_id not in used_tracks
-            ]
+        sorted_clusters = sorted(
+            tracks_by_cluster.items(), key=lambda item: len(item[1]), reverse=True
+        )
 
-            # Check if the genre constitutes >= 20% of the playlist
-            if len(genre_tracks) / total_tracks <= 0.1:
+        for index, (_, cluster_track_ids) in enumerate(sorted_clusters, start=1):
+            playlist_id = await create_playlist(
+                user_id,
+                auth_token,
+                f"{playlist_name} - Cluster {index}",
+                " Made using Splitify: https://splitifytool.com/",
+            )
+
+            if not playlist_id:
                 continue
 
-            # Schedule the creation of this genre's playlist
-            tasks.append(create_and_populate_single_genre_playlist(
-                genre, genre_tracks, tracks_data, user_id, auth_token, playlist_name, used_tracks
-            ))
+            slices = calc_slices(len(cluster_track_ids))
+            add_tasks = []
+            for position in range(0, slices * 100, 100):
+                track_slice = cluster_track_ids[position : position + 100]
+                track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
+                add_tasks.append(add_songs(playlist_id, track_uris, auth_token, position))
 
-        # Run all genre playlist creations concurrently
-        await asyncio.gather(*tasks)
+            await asyncio.gather(*add_tasks)
 
-        log_step_time("Creating and populating subgenre playlists", start_time)
+        log_step_time("Creating and populating cluster playlists", start_time)
     except Exception as e:
-        print(f"Error creating subgenre playlists: {e}")
+        print(f"Error creating cluster playlists: {e}")
 
 
 async def process_single_playlist(auth_token, playlist_id, user_id):
-    """Process a single playlist and divide its tracks into subgenre playlists."""
+    """Split one playlist into K-means cluster playlists."""
     try:
         start_time = time.time()
         print(f"Processing {playlist_id}...")
         playlist_name = get_playlist_name(playlist_id, auth_token)
 
-        print(f"Assigning genre to tracks...")
-        track_genres = await assign_genres_to_tracks(auth_token, playlist_id)
-        tracks_data = {track_id: {"uri": track_id} for track_id in track_genres.keys()}
+        track_ids = await get_playlist_track_ids(auth_token, playlist_id)
+        if not track_ids:
+            print(f"No tracks found for playlist {playlist_id}")
+            return
 
-        sorted_genres = await sort_genres_by_count(track_genres)
-        await create_and_populate_subgenre_playlists(
-            sorted_genres, track_genres, tracks_data, user_id, auth_token, playlist_name
+        audio_features = await get_track_audio_features(track_ids)
+        if not audio_features:
+            print(f"No audio features available for playlist {playlist_id}")
+            return
+
+        clustered_tracks = cluster_df(audio_features)
+        if clustered_tracks.empty:
+            print(f"Failed to cluster tracks for playlist {playlist_id}")
+            return
+
+        await create_and_populate_cluster_playlists(
+            clustered_tracks, user_id, auth_token, playlist_name
         )
+
         log_step_time(f"Processing playlist {playlist_id}", start_time)
     except Exception as e:
         print(f"Error processing playlist {playlist_id}: {e}")
 
 
 async def process_playlists(auth_token, playlist_ids):
-    """Process multiple playlists by splitting them into subgenre playlists."""
+    """Process multiple playlists by splitting with K-means clustering."""
     try:
         start_time = time.time()
         print(f"Processing {len(playlist_ids)} playlists...")
         user_id = get_user_id(auth_token)
+
         tasks = [
             process_single_playlist(auth_token, playlist_id, user_id)
             for playlist_id in playlist_ids
         ]
         await asyncio.gather(*tasks)
+
         log_step_time("Processing all playlists", start_time)
     except Exception as e:
         print(f"Error processing playlists: {e}")

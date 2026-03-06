@@ -4,6 +4,7 @@ import time
 import asyncio
 
 SPOTIFY_API_URL = "https://api.spotify.com/v1"
+RECCOBEATS_API_URL = "https://api.reccobeats.com/v1"
 
 
 def spotify_request(
@@ -28,6 +29,23 @@ def spotify_request(
     if response.status_code >= 400:
         print(f"Spotify API request error: {response.status_code}, {response.text}")
         return {}
+    return response.json()
+
+
+def reccobeats_request(method, endpoint, params=None):
+    url = f"{RECCOBEATS_API_URL}{endpoint}"
+    response = requests.request(method, url, params=params)
+
+    if response.status_code == 429:
+        retry_after = int(response.headers.get("Retry-After", 1))
+        print(f"ReccoBeats rate limited. Retrying after {retry_after} seconds.")
+        time.sleep(retry_after)
+        return reccobeats_request(method, endpoint, params)
+
+    if response.status_code >= 400:
+        print(f"ReccoBeats request error: {response.status_code}, {response.text}")
+        return {}
+
     return response.json()
 
 
@@ -120,7 +138,7 @@ async def get_playlist_children(start_index, playlist_id, auth_token):
     params = {
         "offset": start_index,
         "limit": 100,
-        "fields": "items(track(name,id,artists(id)))",
+        "fields": "items(track(id,uri))",
     }
     response = spotify_request("GET", endpoint, auth_token, params=params)
     return response
@@ -132,6 +150,19 @@ def get_audio_features(track_ids: list[str], auth_token) -> list[dict[str, float
     response = spotify_request("GET", endpoint, auth_token, params=params)
     assert response
     return response["audio_features"]
+
+
+def get_reccobeats_audio_features(track_id: str) -> dict[str, float]:
+    response = reccobeats_request("GET", f"/track/{track_id}/audio-features")
+    if not response:
+        return {}
+
+    payload = response.get("audioFeatures", response)
+    if not isinstance(payload, dict):
+        return {}
+
+    payload["id"] = track_id
+    return payload
 
 
 async def create_playlist(user_id, auth_token, name, description):
