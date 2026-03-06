@@ -1,31 +1,57 @@
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 import pandas as pd
-import json
+
+AUDIO_FEATURE_KEYS = [
+    "acousticness",
+    "danceability",
+    "energy",
+    "instrumentalness",
+    "liveness",
+    "loudness",
+    "speechiness",
+    "tempo",
+    "valence",
+]
 
 
-def calc_clusters():
-    return 3
+def calc_clusters(track_count: int, default_clusters: int = 3) -> int:
+    """Use up to 3 clusters, but never more clusters than tracks."""
+    if track_count <= 0:
+        return 0
+    return min(default_clusters, track_count)
 
 
-def scale_audio_features(
-    dataframe: pd.DataFrame, keys: list[str], weights: list[float]
-):
-    assert len(keys) == len(weights)
-    for index in range(0, len(weights)):
-        dataframe[keys[index]] *= weights[index]
+def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
+    """Return dataframe with track id and assigned K-means cluster."""
+    if not track_audio_features:
+        return pd.DataFrame(columns=["id", "cluster"])
 
+    data = pd.DataFrame(track_audio_features)
+    if "id" not in data.columns:
+        return pd.DataFrame(columns=["id", "cluster"])
 
-def cluster_df(playlist_data):
-    data = pd.DataFrame(playlist_data["tracks"])
-    uri = pd.Series(data["uri"])
-    training_data = data.drop("uri", axis=1)
-    # scale_audio_features(training_data, ["time_signature","tempo", "loudness", "key", "valence", "danceability", "energy", "mode"], [0.1, 0.01, 1/90,0.05, 1.5, 1.2, 2.0, 0.6])
-    with open("training.json", "w") as outfile:
-        json.dump(playlist_data, outfile)
+    available_keys = [key for key in AUDIO_FEATURE_KEYS if key in data.columns]
+    if len(available_keys) < 2:
+        return pd.DataFrame(columns=["id", "cluster"])
 
-    kmeans = KMeans(n_clusters=calc_clusters(), random_state=0, n_init="auto")
-    kmeans.fit(training_data)
-    clusters = kmeans.labels_
-    training_data["cluster"] = clusters
-    training_data["uri"] = uri
-    return training_data
+    feature_frame = data[available_keys].apply(pd.to_numeric, errors="coerce")
+    valid_index = feature_frame.dropna().index
+
+    if len(valid_index) == 0:
+        return pd.DataFrame(columns=["id", "cluster"])
+
+    feature_frame = feature_frame.loc[valid_index]
+    ids = data.loc[valid_index, "id"]
+
+    if len(feature_frame) == 1:
+        return pd.DataFrame({"id": ids.values, "cluster": [0]})
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(feature_frame)
+
+    clusters = calc_clusters(len(feature_frame))
+    model = KMeans(n_clusters=clusters, random_state=0, n_init="auto")
+    labels = model.fit_predict(scaled)
+
+    return pd.DataFrame({"id": ids.values, "cluster": labels})
