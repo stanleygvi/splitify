@@ -1,10 +1,12 @@
 import os
-from pathlib import Path
-from flask import Flask, request, redirect, jsonify, make_response, session
 from datetime import timedelta
-from flask_cors import CORS
+from pathlib import Path
 from urllib.parse import urlencode
+
 from dotenv import load_dotenv
+from flask import Flask, request, redirect, jsonify, make_response, session
+from flask_cors import CORS
+
 from Backend.spotify_api import (
     is_access_token_valid,
     refresh_access_token,
@@ -17,6 +19,7 @@ from Backend.playlist_processing import process_all
 from Backend.helpers import generate_random_string
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:

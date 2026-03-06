@@ -13,6 +13,7 @@ from Backend.spotify_api import (
 )
 from Backend.helpers import calc_slices
 from Backend.grouping import cluster_df
+
 SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 
 
@@ -92,7 +93,9 @@ async def create_and_populate_cluster_playlists(
             for position in range(0, slices * 100, 100):
                 track_slice = valid_cluster_track_ids[position : position + 100]
                 track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
-                add_tasks.append(add_songs(playlist_id, track_uris, auth_token, position))
+                add_tasks.append(
+                    add_songs(playlist_id, track_uris, auth_token, position)
+                )
 
             await asyncio.gather(*add_tasks)
 

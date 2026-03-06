@@ -1,14 +1,16 @@
-import requests
-import os
-import time
 import asyncio
+import os
 import re
+import time
 from urllib.parse import urlparse
+
+import requests
 
 SPOTIFY_API_URL = "https://api.spotify.com/v1"
 RECCOBEATS_API_URL = "https://api.reccobeats.com/v1"
 SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 SPOTIFY_TRACK_PATH_PATTERN = re.compile(r"/track/([A-Za-z0-9]{22})")
+REQUEST_TIMEOUT_SECONDS = 15
 
 
 def get_spotify_redirect_uri() -> str:
@@ -26,7 +28,13 @@ def spotify_request(
     }
 
     response = requests.request(
-        method, url, headers=headers, params=params, data=data, json=json_data
+        method,
+        url,
+        headers=headers,
+        params=params,
+        data=data,
+        json=json_data,
+        timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
     if response.status_code == 429:  # Rate limited
@@ -43,7 +51,9 @@ def spotify_request(
 
 def reccobeats_request(method, endpoint, params=None):
     url = f"{RECCOBEATS_API_URL}{endpoint}"
-    response = requests.request(method, url, params=params)
+    response = requests.request(
+        method, url, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+    )
 
     if response.status_code == 429:
         retry_after = int(response.headers.get("Retry-After", 1))
@@ -75,7 +85,9 @@ def refresh_access_token(refresh_token) -> str:
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    response = requests.post(url, data=data, headers=headers)
+    response = requests.post(
+        url, data=data, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+    )
     if response.status_code != 200:
         print(f"Error refreshing access token: {response.status_code}, {response.text}")
         return ""
@@ -89,7 +101,9 @@ def exchange_code_for_token(code):
     client_secret = os.getenv("CLIENT_SECRET")
     redirect_uri = get_spotify_redirect_uri()
     if not client_id or not client_secret or not redirect_uri:
-        print("Missing Spotify OAuth configuration (CLIENT_ID/CLIENT_SECRET/redirect_uri)")
+        print(
+            "Missing Spotify OAuth configuration (CLIENT_ID/CLIENT_SECRET/redirect_uri)"
+        )
         return None
 
     url = "https://accounts.spotify.com/api/token"
@@ -102,7 +116,9 @@ def exchange_code_for_token(code):
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    response = requests.post(url, data=data, headers=headers)
+    response = requests.post(
+        url, data=data, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+    )
     if response.status_code != 200:
         print(
             f"Error exchanging code for token: {response.status_code}, {response.text}"
@@ -236,7 +252,9 @@ def get_reccobeats_audio_features_batch(
             spotify_id = (
                 _extract_spotify_track_id_from_value(normalized.get("spotifyTrackId"))
                 or _extract_spotify_track_id_from_value(normalized.get("spotifyId"))
-                or _extract_spotify_track_id_from_value(normalized.get("spotify_track_id"))
+                or _extract_spotify_track_id_from_value(
+                    normalized.get("spotify_track_id")
+                )
                 or _extract_spotify_track_id_from_value(normalized.get("spotify_id"))
                 or _extract_spotify_track_id_from_value(normalized.get("href"))
                 or _extract_spotify_track_id_from_value(normalized.get("uri"))
