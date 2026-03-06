@@ -1,51 +1,55 @@
-import redis
 import os
-from flask import Flask, request, redirect, jsonify, url_for, make_response, session
-from flask_session import Session
+from pathlib import Path
+from flask import Flask, request, redirect, jsonify, make_response, session
 from datetime import timedelta
 from flask_cors import CORS
-from urllib.parse import urlparse
+from urllib.parse import urlencode
+from dotenv import load_dotenv
 from Backend.spotify_api import (
     is_access_token_valid,
     refresh_access_token,
     get_all_playlists,
     exchange_code_for_token,
     get_user_id,
+    get_spotify_redirect_uri,
 )
 from Backend.playlist_processing import process_all
 from Backend.helpers import generate_random_string
 
-url = urlparse(os.environ.get("REDIS_URL"))
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-db = redis.Redis(
-    host=url.hostname,
-    port=url.port,
-    password=url.password,
-    ssl=(url.scheme == "rediss"),
-    ssl_cert_reqs=None,
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:3000").rstrip("/")
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", frontend_url).split(",")
+    if origin.strip()
+]
+cookie_secure = parse_bool(os.getenv("SESSION_COOKIE_SECURE"), default=False)
+cookie_samesite = os.getenv(
+    "SESSION_COOKIE_SAMESITE", "None" if cookie_secure else "Lax"
 )
+cookie_domain = os.getenv("SESSION_COOKIE_DOMAIN")
 
 app = Flask(__name__)
 
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY")
-app.config["SESSION_TYPE"] = "redis"
 app.config["SESSION_PERMANENT"] = False
-app.config["SESSION_USE_SIGNER"] = True
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=1)
 
-app.config["SESSION_REDIS"] = db
-
-app.config["SESSION_COOKIE_DOMAIN"] = ".splitify-fac76.web.app"
-app.config["SESSION_COOKIE_SECURE"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "None"
-
-redis_url = os.getenv("REDIS_URL")
-sess = Session()
-sess.init_app(app)
+app.config["SESSION_COOKIE_SECURE"] = cookie_secure
+app.config["SESSION_COOKIE_SAMESITE"] = cookie_samesite
+if cookie_domain:
+    app.config["SESSION_COOKIE_DOMAIN"] = cookie_domain
 
 CORS(
     app,
-    origins=["https://www.splitifytool.com", "https://splitify-fac76.web.app"],
+    origins=cors_origins,
     supports_credentials=True,
 )
 
@@ -53,28 +57,43 @@ CORS(
 @app.route("/login")
 def login_handler():
     uid = session.get("uid")
+    auth_token = session.get("auth_token")
+    refresh_token = session.get("refresh_token")
+
     if uid:
-        auth_token = db.get(f"{uid}_TOKEN")
-        refresh_token = db.get(f"{uid}_REFRESH_TOKEN")
+        if not auth_token:
+            return redirect_to_spotify_login()
+
         if not is_access_token_valid(auth_token):
             if refresh_token:
                 new_auth_token = refresh_access_token(refresh_token)
-                db.set(f"{uid}_TOKEN", new_auth_token)
+                session["auth_token"] = new_auth_token
+                auth_token = new_auth_token
             else:
                 return redirect_to_spotify_login()
 
-        response = make_response(
-            redirect("https://www.splitifytool.com/input-playlist")
-        )
-        response.set_cookie(
-            "auth_token", auth_token, httponly=True, secure=True, samesite="None"
-        )
+        response = make_response(redirect(f"{frontend_url}/input-playlist"))
+        cookie_options = {
+            "httponly": True,
+            "secure": cookie_secure,
+            "samesite": cookie_samesite,
+        }
+        if cookie_domain:
+            cookie_options["domain"] = cookie_domain
+        response.set_cookie("auth_token", auth_token, **cookie_options)
         return response
     return redirect_to_spotify_login()
 
 
 def redirect_to_spotify_login():
     client_id = os.getenv("CLIENT_ID")
+    if not client_id:
+        return "Missing CLIENT_ID in backend environment", 500
+
+    redirect_uri = get_spotify_redirect_uri()
+    if not redirect_uri:
+        return "Missing Spotify redirect URI configuration", 500
+
     state = generate_random_string(16)
     scope = "user-read-private playlist-modify-public playlist-read-private"
 
@@ -83,13 +102,11 @@ def redirect_to_spotify_login():
         "client_id": client_id,
         "scope": scope,
         "show_dialog": "true",
-        "redirect_uri": url_for("callback_handler", _external=True),
+        "redirect_uri": redirect_uri,
         "state": state,
     }
 
-    url = "https://accounts.spotify.com/authorize?" + "&".join(
-        [f"{key}={value}" for key, value in params.items()]
-    )
+    url = "https://accounts.spotify.com/authorize?" + urlencode(params)
     return redirect(url)
 
 
@@ -107,12 +124,19 @@ def callback_handler():
 
     auth_token = token_data.get("access_token")
     user_id = get_user_id(auth_token)
+    session["uid"] = user_id
+    session["auth_token"] = auth_token
+    session["refresh_token"] = token_data.get("refresh_token")
 
-    db.set(f"{user_id}_TOKEN", auth_token)
-    db.set(f"{user_id}_REFRESH_TOKEN", token_data.get("refresh_token"))
-
-    response = make_response(redirect("https://splitify-fac76.web.app/input-playlist"))
-    response.set_cookie("auth_token", auth_token, secure=True, samesite="None")
+    response = make_response(redirect(f"{frontend_url}/input-playlist"))
+    cookie_options = {
+        "httponly": True,
+        "secure": cookie_secure,
+        "samesite": cookie_samesite,
+    }
+    if cookie_domain:
+        cookie_options["domain"] = cookie_domain
+    response.set_cookie("auth_token", auth_token, **cookie_options)
 
     return response
 
