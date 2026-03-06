@@ -2,9 +2,13 @@ import requests
 import os
 import time
 import asyncio
+import re
+from urllib.parse import urlparse
 
 SPOTIFY_API_URL = "https://api.spotify.com/v1"
 RECCOBEATS_API_URL = "https://api.reccobeats.com/v1"
+SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
+SPOTIFY_TRACK_PATH_PATTERN = re.compile(r"/track/([A-Za-z0-9]{22})")
 
 
 def get_spotify_redirect_uri() -> str:
@@ -173,6 +177,104 @@ def get_reccobeats_audio_features(track_id: str) -> dict[str, float]:
 
     payload["id"] = track_id
     return payload
+
+
+def _chunk_list(values: list[str], chunk_size: int) -> list[list[str]]:
+    return [values[i : i + chunk_size] for i in range(0, len(values), chunk_size)]
+
+
+def _is_spotify_track_id(value: str | None) -> bool:
+    return bool(value) and bool(SPOTIFY_TRACK_ID_PATTERN.fullmatch(value))
+
+
+def _extract_spotify_track_id_from_value(value: str | None) -> str | None:
+    if not value or not isinstance(value, str):
+        return None
+
+    if _is_spotify_track_id(value):
+        return value
+
+    if value.startswith("spotify:track:"):
+        candidate = value.split(":")[-1]
+        return candidate if _is_spotify_track_id(candidate) else None
+
+    try:
+        parsed = urlparse(value)
+        if parsed.netloc.endswith("spotify.com"):
+            match = SPOTIFY_TRACK_PATH_PATTERN.search(parsed.path)
+            if match:
+                candidate = match.group(1)
+                return candidate if _is_spotify_track_id(candidate) else None
+    except Exception:
+        return None
+
+    return None
+
+
+def get_reccobeats_audio_features_batch(
+    track_ids: list[str], batch_size: int = 40
+) -> list[dict]:
+    """
+    Fetch audio features in batches from ReccoBeats.
+    Endpoint: GET /v1/audio-features?ids=<comma-separated spotify track ids>
+    """
+    all_features = []
+    cleaned_track_ids = [track_id for track_id in track_ids if track_id]
+    for id_batch in _chunk_list(cleaned_track_ids, batch_size):
+        params = {"ids": ",".join(id_batch)}
+        response = reccobeats_request("GET", "/audio-features", params=params)
+        if not response:
+            continue
+        payload = response.get("content", response)
+        if not isinstance(payload, list):
+            continue
+
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            spotify_id = (
+                _extract_spotify_track_id_from_value(normalized.get("spotifyTrackId"))
+                or _extract_spotify_track_id_from_value(normalized.get("spotifyId"))
+                or _extract_spotify_track_id_from_value(normalized.get("spotify_track_id"))
+                or _extract_spotify_track_id_from_value(normalized.get("spotify_id"))
+                or _extract_spotify_track_id_from_value(normalized.get("href"))
+                or _extract_spotify_track_id_from_value(normalized.get("uri"))
+                or _extract_spotify_track_id_from_value(normalized.get("trackUri"))
+                or _extract_spotify_track_id_from_value(normalized.get("track_uri"))
+            )
+
+            if not _is_spotify_track_id(spotify_id):
+                candidate = normalized.get("id")
+                extracted = _extract_spotify_track_id_from_value(candidate)
+                if _is_spotify_track_id(extracted):
+                    spotify_id = extracted
+                else:
+                    candidate = normalized.get("trackId")
+                    extracted = _extract_spotify_track_id_from_value(candidate)
+                    if _is_spotify_track_id(extracted):
+                        spotify_id = extracted
+            if not _is_spotify_track_id(spotify_id):
+                candidate = normalized.get("trackHref")
+                extracted = _extract_spotify_track_id_from_value(candidate)
+                if _is_spotify_track_id(extracted):
+                    spotify_id = extracted
+            if not _is_spotify_track_id(spotify_id):
+                candidate = normalized.get("track_url")
+                extracted = _extract_spotify_track_id_from_value(candidate)
+                if _is_spotify_track_id(extracted):
+                    spotify_id = extracted
+            if not _is_spotify_track_id(spotify_id):
+                candidate = normalized.get("trackUrl")
+                extracted = _extract_spotify_track_id_from_value(candidate)
+                if _is_spotify_track_id(extracted):
+                    spotify_id = extracted
+
+            if _is_spotify_track_id(spotify_id):
+                normalized["id"] = spotify_id
+                all_features.append(normalized)
+
+    return all_features
 
 
 async def create_playlist(user_id, auth_token, name, description):

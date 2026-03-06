@@ -1,6 +1,7 @@
 import asyncio
 import time
 from collections import defaultdict
+import re
 from Backend.spotify_api import (
     get_playlist_length,
     get_playlist_children,
@@ -8,10 +9,11 @@ from Backend.spotify_api import (
     add_songs,
     get_user_id,
     get_playlist_name,
-    get_reccobeats_audio_features,
+    get_reccobeats_audio_features_batch,
 )
 from Backend.helpers import calc_slices
 from Backend.grouping import cluster_df
+SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 
 
 def log_step_time(step_name, start_time):
@@ -42,20 +44,10 @@ async def get_playlist_track_ids(auth_token, playlist_id):
         return []
 
 
-async def get_track_audio_features(track_ids, max_concurrency=8):
-    """Fetch audio features from ReccoBeats for each Spotify track ID."""
+async def get_track_audio_features(track_ids):
+    """Fetch audio features from ReccoBeats in batch for Spotify track IDs."""
     start_time = time.time()
-    semaphore = asyncio.Semaphore(max_concurrency)
-    features = []
-
-    async def fetch_single(track_id):
-        async with semaphore:
-            data = await asyncio.to_thread(get_reccobeats_audio_features, track_id)
-            if data:
-                features.append(data)
-
-    tasks = [fetch_single(track_id) for track_id in track_ids]
-    await asyncio.gather(*tasks)
+    features = await asyncio.to_thread(get_reccobeats_audio_features_batch, track_ids)
     log_step_time("Fetching audio features", start_time)
     return features
 
@@ -76,6 +68,15 @@ async def create_and_populate_cluster_playlists(
         )
 
         for index, (_, cluster_track_ids) in enumerate(sorted_clusters, start=1):
+            valid_cluster_track_ids = [
+                track_id
+                for track_id in cluster_track_ids
+                if isinstance(track_id, str)
+                and SPOTIFY_TRACK_ID_PATTERN.fullmatch(track_id)
+            ]
+            if not valid_cluster_track_ids:
+                continue
+
             playlist_id = await create_playlist(
                 user_id,
                 auth_token,
@@ -86,10 +87,10 @@ async def create_and_populate_cluster_playlists(
             if not playlist_id:
                 continue
 
-            slices = calc_slices(len(cluster_track_ids))
+            slices = calc_slices(len(valid_cluster_track_ids))
             add_tasks = []
             for position in range(0, slices * 100, 100):
-                track_slice = cluster_track_ids[position : position + 100]
+                track_slice = valid_cluster_track_ids[position : position + 100]
                 track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
                 add_tasks.append(add_songs(playlist_id, track_uris, auth_token, position))
 
