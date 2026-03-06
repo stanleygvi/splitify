@@ -2,7 +2,7 @@ import React, { useEffect } from 'react';
 import { BrowserRouter as Router, Route, Routes, useNavigate } from 'react-router-dom';
 import LoginPage from './LoginPage';
 import PlaylistInputPage from './PlaylistInputPage';
-import './app.css';
+import './App.css';
 
 function App() {
     return (

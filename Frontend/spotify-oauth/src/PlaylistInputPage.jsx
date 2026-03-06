@@ -1,13 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import './PlaylistInputPage.css';
 
+const API_BASE_URL =
+    import.meta.env.VITE_API_BASE_URL ||
+    import.meta.env.REACT_APP_API_BASE_URL ||
+    'http://127.0.0.1:8080';
+
 function PlaylistInputPage() {
     const [playlists, setPlaylists] = useState([]);
     const [selectedPlaylists, setSelectedPlaylists] = useState([]);
 
     useEffect(() => {
 
-        fetch("https://splitify-app-96607781f61f.herokuapp.com/user-playlists", {
+        fetch(`${API_BASE_URL}/user-playlists`, {
             credentials: 'include',
         })
         .then(response => {
@@ -39,7 +44,7 @@ function PlaylistInputPage() {
     const handleProcessPlaylists = () => {
         console.log("Selected Playlists:", selectedPlaylists);
         
-        fetch("https://splitify-app-96607781f61f.herokuapp.com/process-playlist", {
+        fetch(`${API_BASE_URL}/process-playlist`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json"
