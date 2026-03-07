@@ -11,11 +11,3 @@ disable=
     too-many-return-statements,
     too-many-statements
 
-[TYPECHECK]
-ignored-modules=
-    flask,
-    flask_cors,
-    numpy,
-    pandas,
-    requests,
-    sklearn
