@@ -1,3 +1,5 @@
+"""Clustering utilities for grouping tracks by audio feature similarity."""
+
 import numpy as np
 from sklearn.metrics import pairwise_distances
 from sklearn.mixture import GaussianMixture
@@ -270,12 +272,18 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
     if not candidates:
         return pd.DataFrame({"id": ids.values, "cluster": [0] * track_count})
 
-    intra_scores = _score_bounds([candidate["intra"] for candidate in candidates], higher_is_better=False)
+    intra_scores = _score_bounds(
+        [candidate["intra"] for candidate in candidates], higher_is_better=False
+    )
     tail_cohesion_scores = _score_bounds(
         [candidate["intra_p90"] for candidate in candidates], higher_is_better=False
     )
-    inter_scores = _score_bounds([candidate["inter"] for candidate in candidates], higher_is_better=True)
-    bic_scores = _score_bounds([candidate["bic"] for candidate in candidates], higher_is_better=False)
+    inter_scores = _score_bounds(
+        [candidate["inter"] for candidate in candidates], higher_is_better=True
+    )
+    bic_scores = _score_bounds(
+        [candidate["bic"] for candidate in candidates], higher_is_better=False
+    )
     balance_scores = _score_bounds(
         [candidate["imbalance"] for candidate in candidates], higher_is_better=False
     )

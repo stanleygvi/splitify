@@ -15,6 +15,7 @@ FALLBACK_SEARCH_CONCURRENCY = 6
 
 
 def log_step_time(step_name, start_time):
+    """Print elapsed seconds for a named processing step."""
     elapsed_time = time.time() - start_time
     print(f"{step_name} completed in {elapsed_time:.2f} seconds.")
 

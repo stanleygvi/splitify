@@ -1,3 +1,5 @@
+"""Spotify/ReccoBeats API client helpers used by backend routes and processing."""
+
 import asyncio
 import os
 import re
@@ -38,6 +40,7 @@ def _apply_spotify_retry_after(retry_after_seconds: int):
 
 
 def get_spotify_redirect_uri() -> str:
+    """Return OAuth callback URI based on env defaults and overrides."""
     app_base_url = os.getenv("APP_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
     return os.getenv("SPOTIFY_REDIRECT_URI", f"{app_base_url}/callback")
 
@@ -45,6 +48,7 @@ def get_spotify_redirect_uri() -> str:
 def spotify_request(
     method, endpoint, auth_token, params=None, data=None, json_data=None
 ):
+    """Send a Spotify Web API request with shared throttling and retry handling."""
     url = f"{SPOTIFY_API_URL}{endpoint}"
     headers = {
         "Authorization": f"Bearer {auth_token}",
@@ -77,6 +81,7 @@ def spotify_request(
 
 
 def reccobeats_request(method, endpoint, params=None):
+    """Send a ReccoBeats API request with basic rate-limit retry handling."""
     url = f"{RECCOBEATS_API_URL}{endpoint}"
     response = requests.request(
         method, url, params=params, timeout=REQUEST_TIMEOUT_SECONDS
@@ -96,11 +101,13 @@ def reccobeats_request(method, endpoint, params=None):
 
 
 def is_access_token_valid(auth_token) -> bool:
+    """Return whether the Spotify access token can successfully call /me."""
     response = spotify_request("GET", "/me", auth_token)
     return response != {}
 
 
 def refresh_access_token(refresh_token) -> str:
+    """Use refresh token to obtain a new Spotify access token."""
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
     url = "https://accounts.spotify.com/api/token"
@@ -124,6 +131,7 @@ def refresh_access_token(refresh_token) -> str:
 
 
 def exchange_code_for_token(code):
+    """Exchange Spotify OAuth authorization code for tokens."""
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
     redirect_uri = get_spotify_redirect_uri()
@@ -156,6 +164,7 @@ def exchange_code_for_token(code):
 
 
 def get_user_id(auth_token):
+    """Return Spotify user ID for the current access token."""
     response = spotify_request("GET", "/me", auth_token)
     if response:
         return response.get("id")
@@ -163,6 +172,7 @@ def get_user_id(auth_token):
 
 
 def get_all_playlists(auth_token):
+    """Return first page of playlists for the authenticated Spotify user."""
     user_id = get_user_id(auth_token)
     if not user_id:
         return None
@@ -174,6 +184,7 @@ def get_all_playlists(auth_token):
 
 
 def get_playlist_length(playlist_id, auth_token):
+    """Return total track count for a Spotify playlist."""
     endpoint = f"/playlists/{playlist_id}/tracks"
     params = {"fields": "total"}
     response = spotify_request("GET", endpoint, auth_token, params=params)
@@ -183,6 +194,7 @@ def get_playlist_length(playlist_id, auth_token):
 
 
 def get_playlist_name(playlist_id, auth_token):
+    """Return display name for a Spotify playlist."""
     endpoint = f"/playlists/{playlist_id}"
     response = spotify_request("GET", endpoint, auth_token)
     if response:
@@ -191,6 +203,7 @@ def get_playlist_name(playlist_id, auth_token):
 
 
 async def get_playlist_children(start_index, playlist_id, auth_token):
+    """Return one page of playlist tracks using offset pagination."""
     endpoint = f"/playlists/{playlist_id}/tracks"
     params = {
         "offset": start_index,
@@ -202,6 +215,7 @@ async def get_playlist_children(start_index, playlist_id, auth_token):
 
 
 def get_audio_features(track_ids: list[str], auth_token) -> list[dict[str, float]]:
+    """Fetch Spotify audio features for a list of track IDs."""
     endpoint = "/audio-features"
     params = {"ids": ",".join(track_ids)}
     response = spotify_request("GET", endpoint, auth_token, params=params)
@@ -210,6 +224,7 @@ def get_audio_features(track_ids: list[str], auth_token) -> list[dict[str, float
 
 
 def get_reccobeats_audio_features(track_id: str) -> dict[str, float]:
+    """Fetch ReccoBeats audio features for a single track ID."""
     response = reccobeats_request("GET", f"/track/{track_id}/audio-features")
     if not response:
         return {}
@@ -223,14 +238,17 @@ def get_reccobeats_audio_features(track_id: str) -> dict[str, float]:
 
 
 def _chunk_list(values: list[str], chunk_size: int) -> list[list[str]]:
+    """Split list into fixed-size chunks."""
     return [values[i : i + chunk_size] for i in range(0, len(values), chunk_size)]
 
 
 def _is_spotify_track_id(value: str | None) -> bool:
+    """Return whether value matches Spotify 22-char base62 track ID."""
     return bool(value) and bool(SPOTIFY_TRACK_ID_PATTERN.fullmatch(value))
 
 
 def _extract_spotify_track_id_from_value(value: str | None) -> str | None:
+    """Extract Spotify track ID from raw ID/URI/URL string value."""
     if not value or not isinstance(value, str):
         return None
 
@@ -249,7 +267,7 @@ def _extract_spotify_track_id_from_value(value: str | None) -> str | None:
             if match:
                 candidate = match.group(1)
                 return candidate if _is_spotify_track_id(candidate) else None
-    except Exception:
+    except (ValueError, AttributeError):
         return None
 
     return None
@@ -408,6 +426,7 @@ def search_track_ids_by_name_artist(
 
 
 async def create_playlist(user_id, auth_token, name, description):
+    """Create a Spotify playlist and return its ID."""
     endpoint = f"/users/{user_id}/playlists"
     json_data = {"name": name, "description": description, "public": True}
     response = spotify_request("POST", endpoint, auth_token, json_data=json_data)
@@ -417,6 +436,7 @@ async def create_playlist(user_id, auth_token, name, description):
 
 
 async def add_songs(playlist_id, track_uris, auth_token, position):
+    """Add tracks to a Spotify playlist at a given insertion position."""
     endpoint = f"/playlists/{playlist_id}/tracks"
     json_data = {"uris": track_uris, "position": position}
     response = spotify_request("POST", endpoint, auth_token, json_data=json_data)

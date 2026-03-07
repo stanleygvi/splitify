@@ -38,6 +38,7 @@ def _to_float(value):
 
 
 def compute_feature_means(track_ids, feature_by_track_id):
+    """Compute per-feature means for a set of track IDs."""
     means = {}
     for feature in LABEL_FEATURES:
         values = []
@@ -51,6 +52,7 @@ def compute_feature_means(track_ids, feature_by_track_id):
 
 
 def build_cluster_reason(cluster_means, global_means):
+    """Return a short label describing the strongest cluster-vs-global trait deltas."""
     ranked = []
     for feature in LABEL_FEATURES:
         cluster_value = cluster_means.get(feature)
@@ -69,6 +71,7 @@ def build_cluster_reason(cluster_means, global_means):
 
 
 def build_cluster_trait_summary(cluster_means, global_means):
+    """Return a longer comma-separated list of trait drivers for a cluster."""
     ranked = []
     for feature in LABEL_FEATURES:
         cluster_value = cluster_means.get(feature)
@@ -144,9 +147,9 @@ def small_cluster_is_cohesive(track_ids, feature_by_track_id, max_mean_distance=
 
     matrix = np.vstack(vectors)
     distances = []
-    for i in range(len(matrix)):
+    for i, row in enumerate(matrix):
         for j in range(i + 1, len(matrix)):
-            distances.append(float(np.linalg.norm(matrix[i] - matrix[j])))
+            distances.append(float(np.linalg.norm(row - matrix[j])))
     if not distances:
         return False
     return (sum(distances) / len(distances)) <= max_mean_distance

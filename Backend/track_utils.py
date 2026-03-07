@@ -6,6 +6,7 @@ SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 
 
 def is_valid_spotify_track_id(track_id):
+    """Return whether the value is a valid 22-char base62 Spotify track ID."""
     return isinstance(track_id, str) and bool(SPOTIFY_TRACK_ID_PATTERN.fullmatch(track_id))
 
 

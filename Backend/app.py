@@ -1,3 +1,5 @@
+"""Flask API entrypoint for Spotify auth and playlist processing routes."""
+
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +24,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
+    """Parse common env-style truthy values into a boolean."""
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -59,6 +62,7 @@ CORS(
 
 @app.route("/login")
 def login_handler():
+    """Start login flow or reuse existing valid session and redirect to frontend."""
     uid = session.get("uid")
     auth_token = session.get("auth_token")
     refresh_token = session.get("refresh_token")
@@ -89,6 +93,7 @@ def login_handler():
 
 
 def redirect_to_spotify_login():
+    """Build Spotify authorize URL and redirect user to OAuth login."""
     client_id = os.getenv("CLIENT_ID")
     if not client_id:
         return "Missing CLIENT_ID in backend environment", 500
@@ -115,6 +120,7 @@ def redirect_to_spotify_login():
 
 @app.route("/callback")
 def callback_handler():
+    """Handle Spotify OAuth callback and persist auth/session cookies."""
     code = request.args.get("code")
 
     if not code:
@@ -146,6 +152,7 @@ def callback_handler():
 
 @app.route("/user-playlists")
 def get_playlist_handler():
+    """Return current user's Spotify playlists based on auth cookie token."""
     auth_token = request.cookies.get("auth_token")
 
     if not auth_token:
@@ -162,7 +169,7 @@ def get_playlist_handler():
 
 @app.route("/process-playlist", methods=["POST"])
 def process_playlist_handler():
-
+    """Process selected playlists into clustered output playlists."""
     auth_token = request.cookies.get("auth_token")
 
     if not auth_token or not is_access_token_valid(auth_token):

@@ -1,0 +1,21 @@
+[MASTER]
+init-hook=import sys, pathlib; sys.path.append(str(pathlib.Path().resolve()))
+
+[MESSAGES CONTROL]
+disable=
+    cell-var-from-loop,
+    too-many-arguments,
+    too-many-branches,
+    too-many-locals,
+    too-many-positional-arguments,
+    too-many-return-statements,
+    too-many-statements
+
+[TYPECHECK]
+ignored-modules=
+    flask,
+    flask_cors,
+    numpy,
+    pandas,
+    requests,
+    sklearn

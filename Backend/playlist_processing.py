@@ -1,3 +1,5 @@
+"""Playlist processing orchestration for feature fetch, clustering, and output creation."""
+
 import asyncio
 import time
 from collections import defaultdict
@@ -22,36 +24,33 @@ from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
 
 
 def log_step_time(step_name, start_time):
+    """Print elapsed seconds for a named processing step."""
     elapsed_time = time.time() - start_time
     print(f"{step_name} completed in {elapsed_time:.2f} seconds.")
 
 
 async def get_playlist_track_ids(auth_token, playlist_id):
     """Return all track IDs from the playlist."""
-    try:
-        slices = calc_slices(get_playlist_length(playlist_id, auth_token))
-        track_ids = []
+    slices = calc_slices(get_playlist_length(playlist_id, auth_token))
+    track_ids = []
 
-        for i in range(0, slices * 100, 100):
-            response = await get_playlist_children(i, playlist_id, auth_token)
-            if not response or "items" not in response:
-                continue
+    for i in range(0, slices * 100, 100):
+        response = await get_playlist_children(i, playlist_id, auth_token)
+        if not response or "items" not in response:
+            continue
 
-            for item in response["items"]:
-                track = item.get("track") or {}
-                track_id = track.get("id")
-                if track_id:
-                    track_ids.append(track_id)
+        for item in response["items"]:
+            track = item.get("track") or {}
+            track_id = track.get("id")
+            if track_id:
+                track_ids.append(track_id)
 
-        unique_track_ids, duplicate_count = dedupe_track_ids(track_ids)
-        if duplicate_count > 0:
-            print(
-                f"Removed {duplicate_count} duplicate tracks from source playlist {playlist_id}."
-            )
-        return unique_track_ids
-    except Exception as e:
-        print(f"Error getting playlist tracks for {playlist_id}: {e}")
-        return []
+    unique_track_ids, duplicate_count = dedupe_track_ids(track_ids)
+    if duplicate_count > 0:
+        print(
+            f"Removed {duplicate_count} duplicate tracks from source playlist {playlist_id}."
+        )
+    return unique_track_ids
 
 
 async def create_and_populate_cluster_playlists(
@@ -59,139 +58,129 @@ async def create_and_populate_cluster_playlists(
 ):
     """Create one playlist per K-means cluster and add grouped tracks."""
     start_time = time.time()
-    try:
-        tracks_by_cluster = defaultdict(list)
+    tracks_by_cluster = defaultdict(list)
 
-        for _, row in clustered_tracks.iterrows():
-            tracks_by_cluster[int(row["cluster"])].append(row["id"])
+    for _, row in clustered_tracks.iterrows():
+        tracks_by_cluster[int(row["cluster"])].append(row["id"])
 
-        sorted_clusters = sorted(
-            tracks_by_cluster.items(), key=lambda item: len(item[1]), reverse=True
+    sorted_clusters = sorted(
+        tracks_by_cluster.items(), key=lambda item: len(item[1]), reverse=True
+    )
+    global_means = compute_feature_means(
+        list(clustered_tracks["id"]), feature_by_track_id
+    )
+
+    for cluster_id, cluster_track_ids in sorted_clusters:
+        valid_cluster_track_ids = [
+            track_id
+            for track_id in cluster_track_ids
+            if is_valid_spotify_track_id(track_id)
+        ]
+        valid_cluster_track_ids, _ = dedupe_track_ids(valid_cluster_track_ids)
+        if not valid_cluster_track_ids:
+            continue
+        if len(valid_cluster_track_ids) < 3:
+            print(
+                f"Skipping cluster {cluster_id} "
+                f"({len(valid_cluster_track_ids)} tracks): below minimum size."
+            )
+            continue
+        if len(valid_cluster_track_ids) < 5 and not small_cluster_is_cohesive(
+            valid_cluster_track_ids, feature_by_track_id
+        ):
+            print(
+                f"Skipping cluster {cluster_id}: small-cluster cohesion check failed."
+            )
+            continue
+
+        cluster_means = compute_feature_means(
+            valid_cluster_track_ids, feature_by_track_id
         )
-        global_means = compute_feature_means(
-            list(clustered_tracks["id"]), feature_by_track_id
+        cluster_reason = build_cluster_reason(cluster_means, global_means)
+        cluster_trait_summary = build_cluster_trait_summary(
+            cluster_means, global_means
+        )
+        playlist_title = f"{playlist_name} - {cluster_reason}"
+        if len(playlist_title) > 100:
+            playlist_title = playlist_title[:97] + "..."
+
+        playlist_id = await create_playlist(
+            user_id,
+            auth_token,
+            playlist_title,
+            f"Grouped by audio similarity: {cluster_reason}. "
+            f"Trait drivers: {cluster_trait_summary}. "
+            "Made using Splitify: https://splitifytool.com/",
         )
 
-        for index, (cluster_id, cluster_track_ids) in enumerate(sorted_clusters, start=1):
-            valid_cluster_track_ids = [
-                track_id
-                for track_id in cluster_track_ids
-                if is_valid_spotify_track_id(track_id)
-            ]
-            valid_cluster_track_ids, _ = dedupe_track_ids(valid_cluster_track_ids)
-            if not valid_cluster_track_ids:
-                continue
-            if len(valid_cluster_track_ids) < 3:
-                print(
-                    f"Skipping cluster {cluster_id} ({len(valid_cluster_track_ids)} tracks): below minimum size."
-                )
-                continue
-            if len(valid_cluster_track_ids) < 5 and not small_cluster_is_cohesive(
-                valid_cluster_track_ids, feature_by_track_id
-            ):
-                print(
-                    f"Skipping cluster {cluster_id}: small-cluster cohesion check failed."
-                )
-                continue
+        if not playlist_id:
+            continue
 
-            cluster_means = compute_feature_means(
-                valid_cluster_track_ids, feature_by_track_id
-            )
-            cluster_reason = build_cluster_reason(cluster_means, global_means)
-            cluster_trait_summary = build_cluster_trait_summary(
-                cluster_means, global_means
-            )
-            playlist_title = f"{playlist_name} - {cluster_reason}"
-            if len(playlist_title) > 100:
-                playlist_title = playlist_title[:97] + "..."
-
-            playlist_id = await create_playlist(
-                user_id,
-                auth_token,
-                playlist_title,
-                f"Grouped by audio similarity: {cluster_reason}. "
-                f"Trait drivers: {cluster_trait_summary}. "
-                "Made using Splitify: https://splitifytool.com/",
+        slices = calc_slices(len(valid_cluster_track_ids))
+        add_tasks = []
+        for position in range(0, slices * 100, 100):
+            track_slice = valid_cluster_track_ids[position : position + 100]
+            track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
+            add_tasks.append(
+                add_songs(playlist_id, track_uris, auth_token, position)
             )
 
-            if not playlist_id:
-                continue
+        await asyncio.gather(*add_tasks)
 
-            slices = calc_slices(len(valid_cluster_track_ids))
-            add_tasks = []
-            for position in range(0, slices * 100, 100):
-                track_slice = valid_cluster_track_ids[position : position + 100]
-                track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
-                add_tasks.append(
-                    add_songs(playlist_id, track_uris, auth_token, position)
-                )
-
-            await asyncio.gather(*add_tasks)
-
-        log_step_time("Creating and populating cluster playlists", start_time)
-    except Exception as e:
-        print(f"Error creating cluster playlists: {e}")
+    log_step_time("Creating and populating cluster playlists", start_time)
 
 
 async def process_single_playlist(auth_token, playlist_id, user_id):
     """Split one playlist into K-means cluster playlists."""
-    try:
-        start_time = time.time()
-        print(f"Processing {playlist_id}...")
-        playlist_name = get_playlist_name(playlist_id, auth_token)
+    start_time = time.time()
+    print(f"Processing {playlist_id}...")
+    playlist_name = get_playlist_name(playlist_id, auth_token)
 
-        track_ids = await get_playlist_track_ids(auth_token, playlist_id)
-        if not track_ids:
-            print(f"No tracks found for playlist {playlist_id}")
-            return
+    track_ids = await get_playlist_track_ids(auth_token, playlist_id)
+    if not track_ids:
+        print(f"No tracks found for playlist {playlist_id}")
+        return
 
-        audio_features, _reccobeats_diagnostics = await get_track_audio_features(
-            track_ids, auth_token
-        )
-        if not audio_features:
-            print(f"No audio features available for playlist {playlist_id}")
-            return
+    audio_features, _reccobeats_diagnostics = await get_track_audio_features(
+        track_ids, auth_token
+    )
+    if not audio_features:
+        print(f"No audio features available for playlist {playlist_id}")
+        return
 
-        feature_by_track_id = {
-            row["id"]: row for row in audio_features if isinstance(row, dict) and row.get("id")
-        }
-        if len(feature_by_track_id) < len(track_ids):
-            removed = len(track_ids) - len(feature_by_track_id)
-            print(f"Dropped {removed} tracks without usable unique audio features.")
-        clustered_tracks = cluster_df(audio_features)
-        if clustered_tracks.empty:
-            print(f"Failed to cluster tracks for playlist {playlist_id}")
-            return
+    feature_by_track_id = {
+        row["id"]: row for row in audio_features if isinstance(row, dict) and row.get("id")
+    }
+    if len(feature_by_track_id) < len(track_ids):
+        removed = len(track_ids) - len(feature_by_track_id)
+        print(f"Dropped {removed} tracks without usable unique audio features.")
+    clustered_tracks = cluster_df(audio_features)
+    if clustered_tracks.empty:
+        print(f"Failed to cluster tracks for playlist {playlist_id}")
+        return
 
-        await create_and_populate_cluster_playlists(
-            clustered_tracks, feature_by_track_id, user_id, auth_token, playlist_name
-        )
+    await create_and_populate_cluster_playlists(
+        clustered_tracks, feature_by_track_id, user_id, auth_token, playlist_name
+    )
 
-        log_step_time(f"Processing playlist {playlist_id}", start_time)
-    except Exception as e:
-        print(f"Error processing playlist {playlist_id}: {e}")
+    log_step_time(f"Processing playlist {playlist_id}", start_time)
 
 
 async def process_playlists(auth_token, playlist_ids):
     """Process multiple playlists by splitting with K-means clustering."""
-    try:
-        start_time = time.time()
-        print(f"Processing {len(playlist_ids)} playlists...")
-        user_id = get_user_id(auth_token)
+    start_time = time.time()
+    print(f"Processing {len(playlist_ids)} playlists...")
+    user_id = get_user_id(auth_token)
 
-        tasks = [
-            process_single_playlist(auth_token, playlist_id, user_id)
-            for playlist_id in playlist_ids
-        ]
-        await asyncio.gather(*tasks)
+    tasks = [
+        process_single_playlist(auth_token, playlist_id, user_id)
+        for playlist_id in playlist_ids
+    ]
+    await asyncio.gather(*tasks)
 
-        log_step_time("Processing all playlists", start_time)
-    except Exception as e:
-        print(f"Error processing playlists: {e}")
+    log_step_time("Processing all playlists", start_time)
 
 
 def process_all(auth_token, playlist_ids):
-    try:
-        asyncio.run(process_playlists(auth_token, playlist_ids))
-    except Exception as e:
-        print(f"Error in process_all: {e}")
+    """Run async playlist processing entrypoint from sync Flask handler."""
+    asyncio.run(process_playlists(auth_token, playlist_ids))
