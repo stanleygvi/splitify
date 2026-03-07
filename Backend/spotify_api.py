@@ -243,7 +243,8 @@ def _extract_spotify_track_id_from_value(value: str | None) -> str | None:
 
     try:
         parsed = urlparse(value)
-        if parsed.netloc.endswith("spotify.com"):
+        host = parsed.hostname
+        if host and (host == "spotify.com" or host.endswith(".spotify.com")):
             match = SPOTIFY_TRACK_PATH_PATTERN.search(parsed.path)
             if match:
                 candidate = match.group(1)
