@@ -15,24 +15,25 @@ AUDIO_FEATURE_KEYS = [
     "tempo",
     "valence",
 ]
-MIN_CLUSTER_SIZE = 2
+MIN_CLUSTER_SIZE = 3
 ABSOLUTE_MAX_CLUSTERS = 12
-SIMILARITY_WEIGHT = 0.40
-UNIQUENESS_WEIGHT = 0.40
-BIC_WEIGHT = 0.10
-BALANCE_WEIGHT = 0.10
-COHESION_SPLIT_DISTANCE = 2.25
-COHESION_IMPROVEMENT_RATIO = 0.85
+SIMILARITY_WEIGHT = 0.58
+TAIL_COHESION_WEIGHT = 0.22
+UNIQUENESS_WEIGHT = 0.12
+BIC_WEIGHT = 0.05
+BALANCE_WEIGHT = 0.03
+COHESION_SPLIT_DISTANCE = 2.0
+COHESION_IMPROVEMENT_RATIO = 0.92
 FEATURE_WEIGHTS = {
-    "acousticness": 1.35,
-    "danceability": 1.10,
-    "energy": 1.20,
-    "instrumentalness": 1.10,
-    "liveness": 0.90,
-    "loudness": 0.90,
+    "acousticness": 1.10,
+    "danceability": 1.35,
+    "energy": 1.55,
+    "instrumentalness": 0.85,
+    "liveness": 0.70,
+    "loudness": 0.75,
     "speechiness": 1.35,
-    "tempo": 0.75,
-    "valence": 1.15,
+    "tempo": 0.85,
+    "valence": 1.55,
 }
 
 
@@ -116,7 +117,12 @@ def _evaluate_labels(scaled_features: np.ndarray, labels: np.ndarray) -> dict[st
         intra_distances.extend(np.linalg.norm(points - centroid, axis=1).tolist())
 
     if not centroids or not intra_distances:
-        return {"intra": float("inf"), "inter": 0.0, "imbalance": 1.0}
+        return {
+            "intra": float("inf"),
+            "intra_p90": float("inf"),
+            "inter": 0.0,
+            "imbalance": 1.0,
+        }
 
     centroid_array = np.vstack(centroids)
     if len(centroid_array) > 1:
@@ -131,6 +137,7 @@ def _evaluate_labels(scaled_features: np.ndarray, labels: np.ndarray) -> dict[st
 
     return {
         "intra": float(np.mean(intra_distances)),
+        "intra_p90": float(np.percentile(intra_distances, 90)),
         "inter": inter_distance,
         "imbalance": imbalance,
     }
@@ -254,6 +261,7 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
                 "labels": labels,
                 "bic": float(bic),
                 "intra": metrics["intra"],
+                "intra_p90": metrics["intra_p90"],
                 "inter": metrics["inter"],
                 "imbalance": metrics["imbalance"],
             }
@@ -263,6 +271,9 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
         return pd.DataFrame({"id": ids.values, "cluster": [0] * track_count})
 
     intra_scores = _score_bounds([candidate["intra"] for candidate in candidates], higher_is_better=False)
+    tail_cohesion_scores = _score_bounds(
+        [candidate["intra_p90"] for candidate in candidates], higher_is_better=False
+    )
     inter_scores = _score_bounds([candidate["inter"] for candidate in candidates], higher_is_better=True)
     bic_scores = _score_bounds([candidate["bic"] for candidate in candidates], higher_is_better=False)
     balance_scores = _score_bounds(
@@ -274,6 +285,7 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
     for index, _ in enumerate(candidates):
         score = (
             SIMILARITY_WEIGHT * intra_scores[index]
+            + TAIL_COHESION_WEIGHT * tail_cohesion_scores[index]
             + UNIQUENESS_WEIGHT * inter_scores[index]
             + BIC_WEIGHT * bic_scores[index]
             + BALANCE_WEIGHT * balance_scores[index]

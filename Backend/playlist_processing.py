@@ -1,7 +1,6 @@
 import asyncio
 import time
 from collections import defaultdict
-import re
 from Backend.spotify_api import (
     get_playlist_length,
     get_playlist_children,
@@ -9,95 +8,22 @@ from Backend.spotify_api import (
     add_songs,
     get_user_id,
     get_playlist_name,
-    get_reccobeats_audio_features_batch,
 )
 from Backend.helpers import calc_slices
 from Backend.grouping import cluster_df
-
-SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
-LABEL_FEATURES = [
-    "energy",
-    "danceability",
-    "valence",
-    "acousticness",
-    "instrumentalness",
-    "speechiness",
-]
-POSITIVE_LABELS = {
-    "energy": "High Energy",
-    "danceability": "Danceable",
-    "valence": "Upbeat",
-    "acousticness": "Acoustic",
-    "instrumentalness": "Instrumental",
-    "speechiness": "Speech-Heavy",
-}
-NEGATIVE_LABELS = {
-    "energy": "Low Energy",
-    "danceability": "Less Danceable",
-    "valence": "Moody",
-    "acousticness": "Electronic",
-    "instrumentalness": "Vocal-Forward",
-    "speechiness": "Melodic",
-}
+from Backend.audio_feature_pipeline import get_track_audio_features
+from Backend.cluster_insights import (
+    build_cluster_reason,
+    build_cluster_trait_summary,
+    compute_feature_means,
+    small_cluster_is_cohesive,
+)
+from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
 
 
 def log_step_time(step_name, start_time):
     elapsed_time = time.time() - start_time
     print(f"{step_name} completed in {elapsed_time:.2f} seconds.")
-
-
-def _to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _compute_feature_means(track_ids, feature_by_track_id):
-    means = {}
-    for feature in LABEL_FEATURES:
-        values = []
-        for track_id in track_ids:
-            row = feature_by_track_id.get(track_id, {})
-            numeric = _to_float(row.get(feature))
-            if numeric is not None:
-                values.append(numeric)
-        means[feature] = sum(values) / len(values) if values else None
-    return means
-
-
-def _build_cluster_reason(cluster_means, global_means):
-    ranked = []
-    for feature in LABEL_FEATURES:
-        cluster_value = cluster_means.get(feature)
-        global_value = global_means.get(feature)
-        if cluster_value is None or global_value is None:
-            continue
-        delta = cluster_value - global_value
-        if abs(delta) < 0.08:
-            continue
-        label = POSITIVE_LABELS[feature] if delta > 0 else NEGATIVE_LABELS[feature]
-        ranked.append((abs(delta), label))
-
-    if not ranked:
-        return "Balanced Mix"
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return " + ".join(label for _, label in ranked[:2])
-
-
-def _dedupe_track_ids(track_ids):
-    """Return unique track ids in original order and duplicate count."""
-    unique_ids = []
-    seen = set()
-    duplicate_count = 0
-    for track_id in track_ids:
-        if track_id in seen:
-            duplicate_count += 1
-            continue
-        seen.add(track_id)
-        unique_ids.append(track_id)
-    return unique_ids, duplicate_count
 
 
 async def get_playlist_track_ids(auth_token, playlist_id):
@@ -117,7 +43,7 @@ async def get_playlist_track_ids(auth_token, playlist_id):
                 if track_id:
                     track_ids.append(track_id)
 
-        unique_track_ids, duplicate_count = _dedupe_track_ids(track_ids)
+        unique_track_ids, duplicate_count = dedupe_track_ids(track_ids)
         if duplicate_count > 0:
             print(
                 f"Removed {duplicate_count} duplicate tracks from source playlist {playlist_id}."
@@ -126,14 +52,6 @@ async def get_playlist_track_ids(auth_token, playlist_id):
     except Exception as e:
         print(f"Error getting playlist tracks for {playlist_id}: {e}")
         return []
-
-
-async def get_track_audio_features(track_ids):
-    """Fetch audio features from ReccoBeats in batch for Spotify track IDs."""
-    start_time = time.time()
-    features = await asyncio.to_thread(get_reccobeats_audio_features_batch, track_ids)
-    log_step_time("Fetching audio features", start_time)
-    return features
 
 
 async def create_and_populate_cluster_playlists(
@@ -150,26 +68,40 @@ async def create_and_populate_cluster_playlists(
         sorted_clusters = sorted(
             tracks_by_cluster.items(), key=lambda item: len(item[1]), reverse=True
         )
-        global_means = _compute_feature_means(
+        global_means = compute_feature_means(
             list(clustered_tracks["id"]), feature_by_track_id
         )
 
-        for index, (_, cluster_track_ids) in enumerate(sorted_clusters, start=1):
+        for index, (cluster_id, cluster_track_ids) in enumerate(sorted_clusters, start=1):
             valid_cluster_track_ids = [
                 track_id
                 for track_id in cluster_track_ids
-                if isinstance(track_id, str)
-                and SPOTIFY_TRACK_ID_PATTERN.fullmatch(track_id)
+                if is_valid_spotify_track_id(track_id)
             ]
-            valid_cluster_track_ids, _ = _dedupe_track_ids(valid_cluster_track_ids)
+            valid_cluster_track_ids, _ = dedupe_track_ids(valid_cluster_track_ids)
             if not valid_cluster_track_ids:
                 continue
+            if len(valid_cluster_track_ids) < 3:
+                print(
+                    f"Skipping cluster {cluster_id} ({len(valid_cluster_track_ids)} tracks): below minimum size."
+                )
+                continue
+            if len(valid_cluster_track_ids) < 5 and not small_cluster_is_cohesive(
+                valid_cluster_track_ids, feature_by_track_id
+            ):
+                print(
+                    f"Skipping cluster {cluster_id}: small-cluster cohesion check failed."
+                )
+                continue
 
-            cluster_means = _compute_feature_means(
+            cluster_means = compute_feature_means(
                 valid_cluster_track_ids, feature_by_track_id
             )
-            cluster_reason = _build_cluster_reason(cluster_means, global_means)
-            playlist_title = f"{playlist_name} - Cluster {index} ({cluster_reason})"
+            cluster_reason = build_cluster_reason(cluster_means, global_means)
+            cluster_trait_summary = build_cluster_trait_summary(
+                cluster_means, global_means
+            )
+            playlist_title = f"{playlist_name} - {cluster_reason}"
             if len(playlist_title) > 100:
                 playlist_title = playlist_title[:97] + "..."
 
@@ -178,6 +110,7 @@ async def create_and_populate_cluster_playlists(
                 auth_token,
                 playlist_title,
                 f"Grouped by audio similarity: {cluster_reason}. "
+                f"Trait drivers: {cluster_trait_summary}. "
                 "Made using Splitify: https://splitifytool.com/",
             )
 
@@ -212,7 +145,9 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
             print(f"No tracks found for playlist {playlist_id}")
             return
 
-        audio_features = await get_track_audio_features(track_ids)
+        audio_features, _reccobeats_diagnostics = await get_track_audio_features(
+            track_ids, auth_token
+        )
         if not audio_features:
             print(f"No audio features available for playlist {playlist_id}")
             return
