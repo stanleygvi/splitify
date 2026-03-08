@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-from flask import Flask, request, redirect, jsonify, make_response, session
+from flask import Flask, request, redirect, jsonify, session, escape
 from flask_cors import CORS
 
 try:
@@ -148,8 +148,9 @@ def redirect_to_spotify_login():
 @app.route("/api/callback")
 def callback_handler():
     """Handle Spotify OAuth callback and persist auth/session cookies."""
-    if request.args.get("error"):
-        return f"Spotify authorization failed: {request.args.get('error')}", 400
+    error = request.args.get("error")
+    if error:
+        return f"Spotify authorization failed: {escape(error)}", 400
 
     code = request.args.get("code")
     returned_state = request.args.get("state")
