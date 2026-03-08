@@ -1,5 +1,7 @@
 {
   "projects": {
     "default": "splitify-fac76"
-  }
+  },
+  "targets": {},
+  "etags": {}
 }

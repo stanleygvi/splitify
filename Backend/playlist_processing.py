@@ -3,24 +3,44 @@
 import asyncio
 import time
 from collections import defaultdict
-from Backend.spotify_api import (
-    get_playlist_length,
-    get_playlist_children,
-    create_playlist,
-    add_songs,
-    get_user_id,
-    get_playlist_name,
-)
-from Backend.helpers import calc_slices
-from Backend.grouping import cluster_df
-from Backend.audio_feature_pipeline import get_track_audio_features
-from Backend.cluster_insights import (
-    build_cluster_reason,
-    build_cluster_trait_summary,
-    compute_feature_means,
-    small_cluster_is_cohesive,
-)
-from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
+try:
+    from Backend.spotify_api import (
+        get_playlist_length,
+        get_playlist_children,
+        create_playlist,
+        add_songs,
+        get_user_id,
+        get_playlist_name,
+    )
+    from Backend.helpers import calc_slices
+    from Backend.grouping import cluster_df
+    from Backend.audio_feature_pipeline import get_track_audio_features
+    from Backend.cluster_insights import (
+        build_cluster_reason,
+        build_cluster_trait_summary,
+        compute_feature_means,
+        small_cluster_is_cohesive,
+    )
+    from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
+except ModuleNotFoundError:
+    from spotify_api import (  # type: ignore
+        get_playlist_length,
+        get_playlist_children,
+        create_playlist,
+        add_songs,
+        get_user_id,
+        get_playlist_name,
+    )
+    from helpers import calc_slices  # type: ignore
+    from grouping import cluster_df  # type: ignore
+    from audio_feature_pipeline import get_track_audio_features  # type: ignore
+    from cluster_insights import (  # type: ignore
+        build_cluster_reason,
+        build_cluster_trait_summary,
+        compute_feature_means,
+        small_cluster_is_cohesive,
+    )
+    from track_utils import dedupe_track_ids, is_valid_spotify_track_id  # type: ignore
 
 
 def log_step_time(step_name, start_time):
