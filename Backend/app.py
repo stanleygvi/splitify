@@ -6,8 +6,9 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-from flask import Flask, request, redirect, jsonify, session, escape
+from flask import Flask, request, redirect, jsonify, session
 from flask_cors import CORS
+from markupsafe import escape
 
 try:
     from Backend.spotify_api import (
