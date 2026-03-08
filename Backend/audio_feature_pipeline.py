@@ -3,12 +3,20 @@
 import asyncio
 import time
 
-from Backend.spotify_api import (
-    get_reccobeats_audio_features_batch,
-    get_track_metadata_map,
-    search_track_ids_by_name_artist,
-)
-from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
+try:
+    from Backend.spotify_api import (
+        get_reccobeats_audio_features_batch,
+        get_track_metadata_map,
+        search_track_ids_by_name_artist,
+    )
+    from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
+except ModuleNotFoundError:
+    from spotify_api import (  # type: ignore
+        get_reccobeats_audio_features_batch,
+        get_track_metadata_map,
+        search_track_ids_by_name_artist,
+    )
+    from track_utils import dedupe_track_ids, is_valid_spotify_track_id  # type: ignore
 
 FALLBACK_SEARCH_LIMIT = 3
 FALLBACK_SEARCH_CONCURRENCY = 6

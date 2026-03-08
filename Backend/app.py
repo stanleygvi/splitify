@@ -6,19 +6,32 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-from flask import Flask, request, redirect, jsonify, make_response, session
+from flask import Flask, request, redirect, jsonify, session
 from flask_cors import CORS
+from markupsafe import escape
 
-from Backend.spotify_api import (
-    is_access_token_valid,
-    refresh_access_token,
-    get_all_playlists,
-    exchange_code_for_token,
-    get_user_id,
-    get_spotify_redirect_uri,
-)
-from Backend.playlist_processing import process_all
-from Backend.helpers import generate_random_string
+try:
+    from Backend.spotify_api import (
+        is_access_token_valid,
+        refresh_access_token,
+        get_all_playlists,
+        exchange_code_for_token,
+        get_user_id,
+        get_spotify_redirect_uri,
+    )
+    from Backend.playlist_processing import process_all
+    from Backend.helpers import generate_random_string
+except ModuleNotFoundError:
+    from spotify_api import (  # type: ignore
+        is_access_token_valid,
+        refresh_access_token,
+        get_all_playlists,
+        exchange_code_for_token,
+        get_user_id,
+        get_spotify_redirect_uri,
+    )
+    from playlist_processing import process_all  # type: ignore
+    from helpers import generate_random_string  # type: ignore
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -47,6 +60,8 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY")
 app.config["SESSION_PERMANENT"] = False
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=1)
+app.config["SESSION_COOKIE_NAME"] = "__session"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 app.config["SESSION_COOKIE_SECURE"] = cookie_secure
 app.config["SESSION_COOKIE_SAMESITE"] = cookie_samesite
@@ -60,7 +75,27 @@ CORS(
 )
 
 
+def get_auth_token_from_request():
+    """Return auth token from request cookies, falling back to server session."""
+    return session.get("auth_token") or request.cookies.get("auth_token")
+
+
+@app.after_request
+def add_security_headers(response):
+    """Apply baseline security headers for browser-facing responses."""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains; preload"
+        )
+    return response
+
+
 @app.route("/login")
+@app.route("/api/login")
 def login_handler():
     """Start login flow or reuse existing valid session and redirect to frontend."""
     uid = session.get("uid")
@@ -79,16 +114,7 @@ def login_handler():
             else:
                 return redirect_to_spotify_login()
 
-        response = make_response(redirect(f"{frontend_url}/input-playlist"))
-        cookie_options = {
-            "httponly": True,
-            "secure": cookie_secure,
-            "samesite": cookie_samesite,
-        }
-        if cookie_domain:
-            cookie_options["domain"] = cookie_domain
-        response.set_cookie("auth_token", auth_token, **cookie_options)
-        return response
+        return redirect(f"{frontend_url}/input-playlist")
     return redirect_to_spotify_login()
 
 
@@ -103,6 +129,7 @@ def redirect_to_spotify_login():
         return "Missing Spotify redirect URI configuration", 500
 
     state = generate_random_string(16)
+    session["oauth_state"] = state
     scope = "user-read-private playlist-modify-public playlist-read-private"
 
     params = {
@@ -119,12 +146,21 @@ def redirect_to_spotify_login():
 
 
 @app.route("/callback")
+@app.route("/api/callback")
 def callback_handler():
     """Handle Spotify OAuth callback and persist auth/session cookies."""
+    error = request.args.get("error")
+    if error:
+        return f"Spotify authorization failed: {escape(error)}", 400
+
     code = request.args.get("code")
+    returned_state = request.args.get("state")
+    expected_state = session.pop("oauth_state", None)
 
     if not code:
         return "No code present in callback", 400
+    if not expected_state or returned_state != expected_state:
+        return "Invalid OAuth state", 400
 
     token_data = exchange_code_for_token(code)
 
@@ -137,23 +173,14 @@ def callback_handler():
     session["auth_token"] = auth_token
     session["refresh_token"] = token_data.get("refresh_token")
 
-    response = make_response(redirect(f"{frontend_url}/input-playlist"))
-    cookie_options = {
-        "httponly": True,
-        "secure": cookie_secure,
-        "samesite": cookie_samesite,
-    }
-    if cookie_domain:
-        cookie_options["domain"] = cookie_domain
-    response.set_cookie("auth_token", auth_token, **cookie_options)
-
-    return response
+    return redirect(f"{frontend_url}/input-playlist")
 
 
 @app.route("/user-playlists")
+@app.route("/api/user-playlists")
 def get_playlist_handler():
     """Return current user's Spotify playlists based on auth cookie token."""
-    auth_token = request.cookies.get("auth_token")
+    auth_token = get_auth_token_from_request()
 
     if not auth_token:
         print(f"NO AUTH: {auth_token}")
@@ -168,9 +195,10 @@ def get_playlist_handler():
 
 
 @app.route("/process-playlist", methods=["POST"])
+@app.route("/api/process-playlist", methods=["POST"])
 def process_playlist_handler():
     """Process selected playlists into clustered output playlists."""
-    auth_token = request.cookies.get("auth_token")
+    auth_token = get_auth_token_from_request()
 
     if not auth_token or not is_access_token_valid(auth_token):
         return "Authorization required", 401
