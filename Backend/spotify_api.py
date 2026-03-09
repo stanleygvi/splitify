@@ -15,6 +15,9 @@ SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 SPOTIFY_TRACK_PATH_PATTERN = re.compile(r"/track/([A-Za-z0-9]{22})")
 REQUEST_TIMEOUT_SECONDS = 15
 SPOTIFY_REQUEST_INTERVAL_SECONDS = float(os.getenv("SPOTIFY_REQUEST_INTERVAL_SECONDS", "0.25"))
+SPOTIFY_MAX_RETRY_ATTEMPTS = int(os.getenv("SPOTIFY_MAX_RETRY_ATTEMPTS", "3"))
+SPOTIFY_RETRY_BASE_SECONDS = float(os.getenv("SPOTIFY_RETRY_BASE_SECONDS", "0.75"))
+SPOTIFY_RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 _SPOTIFY_RATE_LIMIT_LOCK = threading.Lock()
 _SPOTIFY_NEXT_ALLOWED_TS = 0.0
 
@@ -46,7 +49,13 @@ def get_spotify_redirect_uri() -> str:
 
 
 def spotify_request(
-    method, endpoint, auth_token, params=None, data=None, json_data=None
+    method,
+    endpoint,
+    auth_token,
+    params=None,
+    data=None,
+    json_data=None,
+    retry_attempt: int = 0,
 ):
     """Send a Spotify Web API request with shared throttling and retry handling."""
     url = f"{SPOTIFY_API_URL}{endpoint}"
@@ -57,22 +66,74 @@ def spotify_request(
 
     _wait_for_spotify_slot()
 
-    response = requests.request(
-        method,
-        url,
-        headers=headers,
-        params=params,
-        data=data,
-        json=json_data,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
+    try:
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            data=data,
+            json=json_data,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as error:
+        if retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS:
+            sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** retry_attempt)
+            print(
+                "Spotify request network error. Retrying:",
+                f"attempt={retry_attempt + 1},",
+                f"sleep={sleep_seconds:.2f}s,",
+                f"error={error}",
+            )
+            time.sleep(sleep_seconds)
+            return spotify_request(
+                method,
+                endpoint,
+                auth_token,
+                params,
+                data,
+                json_data,
+                retry_attempt + 1,
+            )
+        print(f"Spotify request network error (final): {error}")
+        return {}
 
     if response.status_code == 429:  # Rate limited
         retry_after = int(response.headers.get("Retry-After", 1))
         print(f"Rate limited. Retrying after {retry_after} seconds.")
         _apply_spotify_retry_after(retry_after)
         time.sleep(retry_after)
-        return spotify_request(method, endpoint, auth_token, params, data, json_data)
+        return spotify_request(
+            method,
+            endpoint,
+            auth_token,
+            params,
+            data,
+            json_data,
+            retry_attempt,
+        )
+
+    if (
+        response.status_code in SPOTIFY_RETRYABLE_STATUS_CODES
+        and retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS
+    ):
+        sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** retry_attempt)
+        print(
+            "Spotify retryable error. Retrying:",
+            f"status={response.status_code},",
+            f"attempt={retry_attempt + 1},",
+            f"sleep={sleep_seconds:.2f}s",
+        )
+        time.sleep(sleep_seconds)
+        return spotify_request(
+            method,
+            endpoint,
+            auth_token,
+            params,
+            data,
+            json_data,
+            retry_attempt + 1,
+        )
 
     if response.status_code >= 400:
         print(f"Spotify API request error: {response.status_code}, {response.text}")
@@ -210,7 +271,9 @@ async def get_playlist_children(start_index, playlist_id, auth_token):
         "limit": 100,
         "fields": "items(track(id,uri))",
     }
-    response = spotify_request("GET", endpoint, auth_token, params=params)
+    response = await asyncio.to_thread(
+        spotify_request, "GET", endpoint, auth_token, params, None, None
+    )
     return response
 
 
@@ -429,18 +492,23 @@ async def create_playlist(user_id, auth_token, name, description):
     """Create a Spotify playlist and return its ID."""
     endpoint = f"/users/{user_id}/playlists"
     json_data = {"name": name, "description": description, "public": True}
-    response = spotify_request("POST", endpoint, auth_token, json_data=json_data)
+    response = await asyncio.to_thread(
+        spotify_request, "POST", endpoint, auth_token, None, None, json_data
+    )
     if response:
         return response.get("id")
     return None
 
 
-async def add_songs(playlist_id, track_uris, auth_token, position):
+async def add_songs(playlist_id, track_uris, auth_token, position=None):
     """Add tracks to a Spotify playlist at a given insertion position."""
     endpoint = f"/playlists/{playlist_id}/tracks"
-    json_data = {"uris": track_uris, "position": position}
-    response = spotify_request("POST", endpoint, auth_token, json_data=json_data)
-    await asyncio.sleep(0.5)
+    json_data = {"uris": track_uris}
+    if position is not None:
+        json_data["position"] = position
+    response = await asyncio.to_thread(
+        spotify_request, "POST", endpoint, auth_token, None, None, json_data
+    )
     if response:
         return response
     return None

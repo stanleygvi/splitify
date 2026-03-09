@@ -1,5 +1,7 @@
 """Clustering utilities for grouping tracks by audio feature similarity."""
 
+import os
+
 import numpy as np
 from sklearn.metrics import pairwise_distances
 from sklearn.mixture import GaussianMixture
@@ -26,6 +28,7 @@ BIC_WEIGHT = 0.05
 BALANCE_WEIGHT = 0.03
 COHESION_SPLIT_DISTANCE = 2.0
 COHESION_IMPROVEMENT_RATIO = 0.92
+DEFAULT_GMM_N_INIT = 3
 FEATURE_WEIGHTS = {
     "acousticness": 1.10,
     "danceability": 1.35,
@@ -37,6 +40,33 @@ FEATURE_WEIGHTS = {
     "tempo": 0.85,
     "valence": 1.55,
 }
+
+
+def _env_positive_int(name: str, default_value: int) -> int:
+    """Parse positive integer env settings with fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default_value
+    parsed_text = raw_value.strip()
+    if not parsed_text or not parsed_text.lstrip("-").isdigit():
+        return default_value
+
+    parsed_value = int(parsed_text)
+    if parsed_value <= 0:
+        return 1
+    return parsed_value
+
+
+MAX_K_CANDIDATES = _env_positive_int("CLUSTER_MAX_K_CANDIDATES", 10)
+MAX_OUTPUT_PLAYLISTS = _env_positive_int("MAX_OUTPUT_PLAYLISTS", 10)
+LARGE_PLAYLIST_TRACK_THRESHOLD = _env_positive_int(
+    "CLUSTER_LARGE_PLAYLIST_THRESHOLD", 700
+)
+LARGE_PLAYLIST_MAX_K_CANDIDATES = _env_positive_int(
+    "CLUSTER_LARGE_MAX_K_CANDIDATES", 6
+)
+LARGE_PLAYLIST_GMM_N_INIT = _env_positive_int("CLUSTER_LARGE_GMM_N_INIT", 2)
+REFINE_MAX_TRACKS = _env_positive_int("CLUSTER_REFINE_MAX_TRACKS", 600)
 
 
 def _merge_small_clusters(
@@ -145,6 +175,27 @@ def _evaluate_labels(scaled_features: np.ndarray, labels: np.ndarray) -> dict[st
     }
 
 
+def _candidate_k_values(k_upper_bound: int, track_count: int) -> list[int]:
+    """Return a bounded set of k candidates for GMM search."""
+    all_values = list(range(2, k_upper_bound + 1))
+    if not all_values:
+        return []
+
+    max_candidates = MAX_K_CANDIDATES
+    if track_count >= LARGE_PLAYLIST_TRACK_THRESHOLD:
+        max_candidates = min(max_candidates, LARGE_PLAYLIST_MAX_K_CANDIDATES)
+    if len(all_values) <= max_candidates:
+        return all_values
+
+    index_values = np.linspace(
+        0, len(all_values) - 1, num=max_candidates, dtype=int
+    ).tolist()
+    selected_values = sorted({all_values[index] for index in index_values})
+    if all_values[-1] not in selected_values:
+        selected_values.append(all_values[-1])
+    return sorted(set(selected_values))
+
+
 def _refine_cluster_cohesion(
     scaled_features: np.ndarray, labels: np.ndarray, min_cluster_size: int
 ) -> np.ndarray:
@@ -232,6 +283,7 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
 
     track_count = len(feature_frame)
     k_upper_bound = min(
+        MAX_OUTPUT_PLAYLISTS,
         ABSOLUTE_MAX_CLUSTERS,
         max(2, track_count // MIN_CLUSTER_SIZE),
         track_count - 1,
@@ -240,19 +292,26 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
         return pd.DataFrame({"id": ids.values, "cluster": [0] * track_count})
 
     candidates = []
+    gmm_n_init = (
+        LARGE_PLAYLIST_GMM_N_INIT
+        if track_count >= LARGE_PLAYLIST_TRACK_THRESHOLD
+        else DEFAULT_GMM_N_INIT
+    )
+    candidate_k_values = _candidate_k_values(k_upper_bound, track_count)
 
-    for k in range(2, k_upper_bound + 1):
+    for k in candidate_k_values:
         model = GaussianMixture(
             n_components=k,
             covariance_type="diag",
-            n_init=3,
+            n_init=gmm_n_init,
             random_state=0,
         )
         model.fit(weighted_scaled)
         bic = model.bic(weighted_scaled)
         labels = model.predict(weighted_scaled)
         labels = _merge_small_clusters(weighted_scaled, np.array(labels), MIN_CLUSTER_SIZE)
-        labels = _refine_cluster_cohesion(weighted_scaled, labels, MIN_CLUSTER_SIZE)
+        if track_count <= REFINE_MAX_TRACKS:
+            labels = _refine_cluster_cohesion(weighted_scaled, labels, MIN_CLUSTER_SIZE)
         labels = _reindex_labels(labels)
         if len(set(labels.tolist())) < 2:
             continue
