@@ -277,7 +277,7 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
         removed = len(track_ids) - len(feature_by_track_id)
         print(f"Dropped {removed} tracks without usable unique audio features.")
     cluster_start = time.time()
-    clustered_tracks = cluster_df(audio_features)
+    clustered_tracks = await asyncio.to_thread(cluster_df, audio_features)
     log_step_time(f"Cluster tracks ({playlist_id})", cluster_start)
     if clustered_tracks.empty:
         print(f"Failed to cluster tracks for playlist {playlist_id}")
