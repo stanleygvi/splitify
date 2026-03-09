@@ -6,7 +6,6 @@ import time
 from collections import defaultdict
 try:
     from Backend.spotify_api import (
-        get_playlist_length,
         get_playlist_children,
         create_playlist,
         add_songs,
@@ -25,7 +24,6 @@ try:
     from Backend.track_utils import dedupe_track_ids, is_valid_spotify_track_id
 except ModuleNotFoundError:
     from spotify_api import (  # type: ignore
-        get_playlist_length,
         get_playlist_children,
         create_playlist,
         add_songs,
@@ -68,17 +66,26 @@ def log_step_time(step_name, start_time):
 async def get_playlist_track_ids(auth_token, playlist_id):
     """Return all track IDs from the playlist."""
     start_time = time.time()
-    slices = calc_slices(get_playlist_length(playlist_id, auth_token))
     track_ids = []
-
-    offsets = list(range(0, slices * 100, 100))
+    first_page_response = await get_playlist_children(
+        0, playlist_id, auth_token, include_total=True
+    )
+    total_tracks = (
+        first_page_response.get("total", 0)
+        if isinstance(first_page_response, dict)
+        else 0
+    )
+    slices = calc_slices(total_tracks)
+    responses = [first_page_response] if first_page_response else []
+    offsets = list(range(100, slices * 100, 100))
     semaphore = asyncio.Semaphore(FETCH_PAGE_CONCURRENCY)
 
     async def fetch_page(offset):
         async with semaphore:
             return await get_playlist_children(offset, playlist_id, auth_token)
 
-    responses = await asyncio.gather(*(fetch_page(offset) for offset in offsets))
+    if offsets:
+        responses.extend(await asyncio.gather(*(fetch_page(offset) for offset in offsets)))
     for response in responses:
         if not response or "items" not in response:
             continue
@@ -97,7 +104,7 @@ async def get_playlist_track_ids(auth_token, playlist_id):
     print(
         "Playlist track fetch stats:",
         f"playlist_id={playlist_id},",
-        f"pages={len(offsets)},",
+        f"pages={len(responses)},",
         f"tracks={len(unique_track_ids)},",
         f"duration={time.time() - start_time:.2f}s",
     )

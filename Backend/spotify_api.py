@@ -309,13 +309,16 @@ def get_playlist_name(playlist_id, auth_token):
     return ""
 
 
-async def get_playlist_children(start_index, playlist_id, auth_token):
+async def get_playlist_children(start_index, playlist_id, auth_token, include_total=False):
     """Return one page of playlist tracks using offset pagination."""
+    fields = "items(track(id,uri))"
+    if include_total:
+        fields = "total,items(track(id,uri))"
     endpoint = f"/playlists/{playlist_id}/tracks"
     params = {
         "offset": start_index,
         "limit": 100,
-        "fields": "items(track(id,uri))",
+        "fields": fields,
     }
     response = await asyncio.to_thread(
         spotify_request, "GET", endpoint, auth_token, params, None, None
