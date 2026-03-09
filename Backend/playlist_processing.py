@@ -44,12 +44,17 @@ except ModuleNotFoundError:
 
 def _env_positive_int(name: str, default_value: int) -> int:
     """Parse positive integer env values with safe fallback."""
-    raw_value = os.getenv(name, str(default_value))
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default_value
+    candidate = raw_value.strip()
+    if not candidate:
+        return default_value
     try:
-        parsed = int(raw_value)
+        parsed = int(candidate)
     except ValueError:
         return default_value
-    return max(1, parsed)
+    return parsed if parsed > 0 else 1
 
 
 FETCH_PAGE_CONCURRENCY = _env_positive_int("PLAYLIST_FETCH_PAGE_CONCURRENCY", 8)
@@ -180,64 +185,89 @@ async def create_and_populate_cluster_playlists(
         print("No eligible clusters to create playlists for.")
         return
 
-    create_start = time.time()
+    pipeline_start = time.time()
     create_semaphore = asyncio.Semaphore(CREATE_PLAYLIST_CONCURRENCY)
+    add_semaphore = asyncio.Semaphore(ADD_SONGS_CONCURRENCY)
 
-    async def create_cluster_playlist(candidate):
+    async def process_cluster(candidate):
+        create_duration = 0.0
+        add_duration = 0.0
+        add_calls = 0
+        add_calls_successful = 0
+        tracks_added = 0
+
         async with create_semaphore:
+            create_call_start = time.time()
             created_playlist_id = await create_playlist(
                 user_id,
                 auth_token,
                 candidate["playlist_title"],
                 candidate["playlist_description"],
             )
+            create_duration += time.time() - create_call_start
+
         if not created_playlist_id:
-            return None
-        return (candidate, created_playlist_id)
+            return {
+                "cluster_created": 0,
+                "create_calls": 1,
+                "create_time": create_duration,
+                "add_calls": add_calls,
+                "add_calls_successful": add_calls_successful,
+                "tracks_added": tracks_added,
+                "add_time": add_duration,
+            }
 
-    created_entries = await asyncio.gather(
-        *(create_cluster_playlist(candidate) for candidate in cluster_candidates)
-    )
-    created_entries = [entry for entry in created_entries if entry is not None]
-    create_duration = time.time() - create_start
-
-    add_jobs = []
-    total_tracks_to_add = 0
-    for candidate, created_playlist_id in created_entries:
         track_ids = candidate["track_ids"]
         slices = calc_slices(len(track_ids))
         for index in range(0, slices * 100, 100):
             track_slice = track_ids[index : index + 100]
             track_uris = [f"spotify:track:{track_id}" for track_id in track_slice]
-            total_tracks_to_add += len(track_uris)
-            add_jobs.append((created_playlist_id, track_uris))
+            tracks_added += len(track_uris)
+            add_calls += 1
 
-    add_duration = 0.0
-    successful_add_calls = 0
-    if add_jobs:
-        add_start = time.time()
-        add_semaphore = asyncio.Semaphore(ADD_SONGS_CONCURRENCY)
-
-        async def add_song_batch(job):
-            playlist_id, track_uris = job
             async with add_semaphore:
                 # Avoid "Index out of bounds" races by appending without explicit position.
-                return await add_songs(playlist_id, track_uris, auth_token)
+                add_call_start = time.time()
+                add_result = await add_songs(created_playlist_id, track_uris, auth_token)
+                add_duration += time.time() - add_call_start
+            if add_result:
+                add_calls_successful += 1
 
-        add_results = await asyncio.gather(*(add_song_batch(job) for job in add_jobs))
-        successful_add_calls = sum(1 for result in add_results if result)
-        add_duration = time.time() - add_start
+        return {
+            "cluster_created": 1,
+            "create_calls": 1,
+            "create_time": create_duration,
+            "add_calls": add_calls,
+            "add_calls_successful": add_calls_successful,
+            "tracks_added": tracks_added,
+            "add_time": add_duration,
+        }
+
+    cluster_results = await asyncio.gather(
+        *(process_cluster(candidate) for candidate in cluster_candidates)
+    )
+    clusters_created = sum(result["cluster_created"] for result in cluster_results)
+    create_calls = sum(result["create_calls"] for result in cluster_results)
+    create_duration = sum(result["create_time"] for result in cluster_results)
+    add_calls = sum(result["add_calls"] for result in cluster_results)
+    successful_add_calls = sum(
+        result["add_calls_successful"] for result in cluster_results
+    )
+    total_tracks_to_add = sum(result["tracks_added"] for result in cluster_results)
+    add_duration = sum(result["add_time"] for result in cluster_results)
+    pipeline_duration = time.time() - pipeline_start
 
     print(
         "Playlist write stats:",
         f"clusters_considered={len(sorted_clusters)},",
-        f"clusters_created={len(created_entries)},",
-        f"create_calls={len(cluster_candidates)},",
+        f"clusters_created={clusters_created},",
+        f"create_calls={create_calls},",
         f"create_time={create_duration:.2f}s,",
-        f"add_calls={len(add_jobs)},",
+        f"add_calls={add_calls},",
         f"add_calls_successful={successful_add_calls},",
         f"tracks_added={total_tracks_to_add},",
-        f"add_time={add_duration:.2f}s",
+        f"add_time={add_duration:.2f}s,",
+        f"pipeline_time={pipeline_duration:.2f}s",
     )
 
     log_step_time("Creating and populating cluster playlists", start_time)
@@ -248,15 +278,18 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
     start_time = time.time()
     print(f"Processing {playlist_id}...")
     playlist_name_start = time.time()
-    playlist_name = get_playlist_name(playlist_id, auth_token)
-    log_step_time(
-        f"Fetch source playlist name ({playlist_id})",
-        playlist_name_start,
+    playlist_name_task = asyncio.create_task(
+        asyncio.to_thread(get_playlist_name, playlist_id, auth_token)
     )
 
     track_fetch_start = time.time()
     track_ids = await get_playlist_track_ids(auth_token, playlist_id)
     log_step_time(f"Collect playlist tracks ({playlist_id})", track_fetch_start)
+    playlist_name = await playlist_name_task
+    log_step_time(
+        f"Fetch source playlist name ({playlist_id})",
+        playlist_name_start,
+    )
     if not track_ids:
         print(f"No tracks found for playlist {playlist_id}")
         return
