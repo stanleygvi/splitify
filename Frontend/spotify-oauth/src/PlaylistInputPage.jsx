@@ -9,6 +9,7 @@ const API_BASE_URL =
 function PlaylistInputPage() {
     const [playlists, setPlaylists] = useState([]);
     const [selectedPlaylists, setSelectedPlaylists] = useState([]);
+    const [isProcessing, setIsProcessing] = useState(false);
 
     useEffect(() => {
 
@@ -43,7 +44,12 @@ function PlaylistInputPage() {
 
     const handleProcessPlaylists = () => {
         console.log("Selected Playlists:", selectedPlaylists);
-        
+        if (!selectedPlaylists.length) {
+            alert("Select at least one playlist.");
+            return;
+        }
+        setIsProcessing(true);
+
         fetch(`${API_BASE_URL}/process-playlist`, {
             method: "POST",
             headers: {
@@ -52,18 +58,48 @@ function PlaylistInputPage() {
             credentials: 'include',
             body: JSON.stringify({ playlistIds: selectedPlaylists })
         })
-        .then(response => {
+        .then(async response => {
             if (!response.ok) {
-                throw new Error("Network response was not ok");
+                const errorText = await response.text();
+                throw new Error(
+                    `Request failed (${response.status} ${response.statusText}): ${errorText}`
+                );
             }
             return response.json();
         })
         .then(data => {
-            console.log("Response from server:", data);
-            alert("Playlists processed successfully!");
+            if (!data || !data.jobId) {
+                throw new Error("Missing jobId from backend response");
+            }
+            console.log("Started processing job:", data.jobId);
+            return data.jobId;
+        })
+        .then(jobId => {
+            const pollDelayMs = 4000;
+            const pollJob = () => fetch(
+                `${API_BASE_URL}/process-playlist-status/${jobId}`,
+                { credentials: 'include' }
+            )
+            .then(response => response.json())
+            .then(statusPayload => {
+                const status = statusPayload.status;
+                if (status === "succeeded") {
+                    alert("Playlists processed successfully!");
+                    setIsProcessing(false);
+                    return;
+                }
+                if (status === "failed") {
+                    throw new Error(statusPayload.error || "Processing failed");
+                }
+                setTimeout(pollJob, pollDelayMs);
+            });
+
+            return pollJob();
         })
         .catch(error => {
             console.error("There was a problem with the fetch operation:", error);
+            alert(`Processing failed: ${error.message}`);
+            setIsProcessing(false);
         });
     };
     
@@ -90,7 +126,9 @@ function PlaylistInputPage() {
                     </li>
                 ))}
             </ul>
-            <button onClick={handleProcessPlaylists}>Process Selected Playlists</button>
+            <button onClick={handleProcessPlaylists} disabled={isProcessing}>
+                {isProcessing ? "Processing..." : "Process Selected Playlists"}
+            </button>
         </div>
     );
 }
