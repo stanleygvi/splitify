@@ -3,12 +3,15 @@
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
 SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 365 * 24 * 60 * 60
+DEFAULT_POOL_MIN_CONN = 1
+DEFAULT_POOL_MAX_CONN = 8
 
 
 def _parse_ttl_seconds(env_name: str, default_value: int) -> int:
@@ -31,12 +34,28 @@ def _database_url() -> str:
     return db_url
 
 
+def _parse_pool_size(env_name: str, default_value: int) -> int:
+    """Parse positive pool size setting with fallback."""
+    raw_value = os.getenv(env_name, str(default_value)).strip()
+    if not raw_value.lstrip("-").isdigit():
+        return default_value
+    parsed = int(raw_value)
+    return max(1, parsed)
+
+
 CACHE_TTL_SECONDS = _parse_ttl_seconds(
     "TRACK_CACHE_TTL_SECONDS", 30 * 24 * 60 * 60
 )
 MISS_TTL_SECONDS = _parse_ttl_seconds(
     "TRACK_CACHE_MISS_TTL_SECONDS", 7 * 24 * 60 * 60
 )
+POOL_MIN_CONN = _parse_pool_size("TRACK_CACHE_DB_POOL_MIN", DEFAULT_POOL_MIN_CONN)
+POOL_MAX_CONN = _parse_pool_size("TRACK_CACHE_DB_POOL_MAX", DEFAULT_POOL_MAX_CONN)
+
+_POOL = None
+_POOL_LOCK = threading.Lock()
+_SCHEMA_READY = False
+_SCHEMA_LOCK = threading.Lock()
 
 
 def _cache_enabled() -> bool:
@@ -49,42 +68,99 @@ def _is_valid_track_id(track_id: str | None) -> bool:
     return bool(track_id) and bool(SPOTIFY_TRACK_ID_PATTERN.fullmatch(track_id))
 
 
-def _get_connection():
-    """Create a Postgres connection from DATABASE_URL."""
-    db_url = _database_url()
-    if not db_url:
+def _pool_bounds() -> tuple[int, int]:
+    """Return valid min/max pool bounds."""
+    min_conn = max(1, POOL_MIN_CONN)
+    max_conn = max(min_conn, POOL_MAX_CONN)
+    return min_conn, max_conn
+
+
+def _load_pool_class():
+    """Load psycopg2 pooled connection class lazily."""
+    pool_module = __import__("psycopg2.pool", fromlist=["ThreadedConnectionPool"])
+    return pool_module.ThreadedConnectionPool
+
+
+def _load_execute_values():
+    """Load psycopg2 execute_values helper lazily."""
+    extras_module = __import__("psycopg2.extras", fromlist=["execute_values"])
+    return extras_module.execute_values
+
+
+def _get_pool():
+    """Create (or return) pooled DB connector."""
+    if not _cache_enabled():
         return None
-    psycopg2_module = __import__("psycopg2")
-    return psycopg2_module.connect(db_url, connect_timeout=10)
+    global _POOL  # pylint: disable=global-statement
+    if _POOL is not None:
+        return _POOL
+
+    with _POOL_LOCK:
+        if _POOL is not None:
+            return _POOL
+        pool_class = _load_pool_class()
+        min_conn, max_conn = _pool_bounds()
+        _POOL = pool_class(
+            min_conn,
+            max_conn,
+            _database_url(),
+            connect_timeout=10,
+        )
+    return _POOL
+
+
+def _acquire_connection():
+    """Acquire connection from pool."""
+    pool = _get_pool()
+    if pool is None:
+        return None, None
+    return pool, pool.getconn()
+
+
+def _release_connection(pool, connection):
+    """Return connection to pool."""
+    if pool is None or connection is None:
+        return
+    pool.putconn(connection)
 
 
 def _ensure_schema() -> None:
     """Create cache table if needed."""
+    global _SCHEMA_READY  # pylint: disable=global-statement
     if not _cache_enabled():
         return
-    conn = _get_connection()
-    if conn is None:
+    if _SCHEMA_READY:
         return
-    with conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS track_audio_cache (
-                    track_id TEXT PRIMARY KEY,
-                    payload_json TEXT,
-                    known_missing BOOLEAN NOT NULL DEFAULT FALSE,
-                    miss_reason TEXT,
-                    source TEXT,
-                    updated_at BIGINT NOT NULL
-                )
-                """
-            )
-    conn.close()
-
-
-def _chunk_values(values: list[str], size: int = 500) -> list[list[str]]:
-    """Split large ID lists to manageable query batches."""
-    return [values[i : i + size] for i in range(0, len(values), size)]
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        pool, connection = _acquire_connection()
+        if connection is None:
+            return
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS track_audio_cache (
+                            track_id TEXT PRIMARY KEY,
+                            payload_json TEXT,
+                            known_missing BOOLEAN NOT NULL DEFAULT FALSE,
+                            miss_reason TEXT,
+                            source TEXT,
+                            updated_at BIGINT NOT NULL
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_track_audio_cache_updated_at
+                        ON track_audio_cache (updated_at)
+                        """
+                    )
+            _SCHEMA_READY = True
+        finally:
+            _release_connection(pool, connection)
 
 
 def get_cached_track_features(
@@ -107,40 +183,43 @@ def get_cached_track_features(
     features_by_track_id: dict[str, dict[str, Any]] = {}
     misses_by_track_id: dict[str, str] = {}
 
-    conn = _get_connection()
-    if conn is None:
+    pool, connection = _acquire_connection()
+    if connection is None:
         return {}, {}
     try:
-        with conn.cursor() as cursor:
-            for chunk in _chunk_values(valid_track_ids):
-                placeholders = ",".join(["%s"] * len(chunk))
-                query = (
-                    "SELECT track_id, payload_json, known_missing, miss_reason, updated_at "
-                    f"FROM track_audio_cache WHERE track_id IN ({placeholders})"
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT track_id, payload_json, known_missing, miss_reason
+                FROM track_audio_cache
+                WHERE track_id = ANY(%s)
+                AND (
+                    (known_missing = FALSE AND payload_json IS NOT NULL AND updated_at >= %s)
+                    OR
+                    (known_missing = TRUE AND updated_at >= %s)
                 )
-                cursor.execute(query, chunk)
-                rows = cursor.fetchall()
-                for track_id, payload_json, known_missing, miss_reason, updated_at in rows:
-                    if known_missing:
-                        if updated_at >= min_miss_updated_at:
-                            misses_by_track_id[str(track_id)] = (
-                                str(miss_reason)
-                                if miss_reason
-                                else "known_missing_cached"
-                            )
-                        continue
+                """,
+                (valid_track_ids, min_feature_updated_at, min_miss_updated_at),
+            )
+            rows = cursor.fetchall()
+            for track_id, payload_json, known_missing, miss_reason in rows:
+                if known_missing:
+                    misses_by_track_id[str(track_id)] = (
+                        str(miss_reason) if miss_reason else "known_missing_cached"
+                    )
+                    continue
 
-                    if not payload_json or updated_at < min_feature_updated_at:
-                        continue
-                    try:
-                        payload = json.loads(payload_json)
-                        if isinstance(payload, dict):
-                            payload["id"] = str(track_id)
-                            features_by_track_id[str(track_id)] = payload
-                    except (TypeError, json.JSONDecodeError):
-                        continue
+                if not payload_json:
+                    continue
+                try:
+                    payload = json.loads(payload_json)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    payload["id"] = str(track_id)
+                    features_by_track_id[str(track_id)] = payload
     finally:
-        conn.close()
+        _release_connection(pool, connection)
 
     return features_by_track_id, misses_by_track_id
 
@@ -174,17 +253,19 @@ def cache_track_features(
     if not rows:
         return
 
-    conn = _get_connection()
-    if conn is None:
+    pool, connection = _acquire_connection()
+    if connection is None:
         return
     try:
-        with conn:
-            with conn.cursor() as cursor:
-                cursor.executemany(
+        execute_values = _load_execute_values()
+        with connection:
+            with connection.cursor() as cursor:
+                execute_values(
+                    cursor,
                     """
                     INSERT INTO track_audio_cache
                         (track_id, payload_json, known_missing, miss_reason, source, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES %s
                     ON CONFLICT(track_id) DO UPDATE SET
                         payload_json=excluded.payload_json,
                         known_missing=FALSE,
@@ -193,9 +274,11 @@ def cache_track_features(
                         updated_at=excluded.updated_at
                     """,
                     rows,
+                    template="(%s, %s, %s, %s, %s, %s)",
+                    page_size=500,
                 )
     finally:
-        conn.close()
+        _release_connection(pool, connection)
 
 
 def cache_known_misses(miss_reasons_by_track_id: dict[str, str]) -> None:
@@ -213,17 +296,19 @@ def cache_known_misses(miss_reasons_by_track_id: dict[str, str]) -> None:
     if not rows:
         return
 
-    conn = _get_connection()
-    if conn is None:
+    pool, connection = _acquire_connection()
+    if connection is None:
         return
     try:
-        with conn:
-            with conn.cursor() as cursor:
-                cursor.executemany(
+        execute_values = _load_execute_values()
+        with connection:
+            with connection.cursor() as cursor:
+                execute_values(
+                    cursor,
                     """
                     INSERT INTO track_audio_cache
                         (track_id, payload_json, known_missing, miss_reason, source, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES %s
                     ON CONFLICT(track_id) DO UPDATE SET
                         payload_json=NULL,
                         known_missing=TRUE,
@@ -232,6 +317,8 @@ def cache_known_misses(miss_reasons_by_track_id: dict[str, str]) -> None:
                         updated_at=excluded.updated_at
                     """,
                     rows,
+                    template="(%s, %s, %s, %s, %s, %s)",
+                    page_size=500,
                 )
     finally:
-        conn.close()
+        _release_connection(pool, connection)

@@ -109,6 +109,7 @@ async def get_track_audio_features(track_ids, auth_token):
         if diagnostics.get(track_id) != "ok"
     ]
     resolved_count = 0
+    fallback_resolved_features = []
 
     if missing_track_ids:
         metadata_map = await asyncio.to_thread(
@@ -187,25 +188,28 @@ async def get_track_audio_features(track_ids, auth_token):
                     normalized = dict(replacement)
                     normalized["id"] = missing_track_id
                     features.append(normalized)
+                    fallback_resolved_features.append(normalized)
                     diagnostics[missing_track_id] = "ok"
                     resolved_count += 1
                 elif diagnostics.get(missing_track_id) != "ok":
                     diagnostics[missing_track_id] = "fallback_candidates_not_in_reccobeats"
 
     unresolved_misses = {
-        track_id: reason
-        for track_id, reason in diagnostics.items()
-        if reason != "ok"
+        track_id: diagnostics.get(track_id, "unknown")
+        for track_id in track_ids_to_fetch
+        if diagnostics.get(track_id) != "ok"
     }
     if unresolved_misses:
         await asyncio.to_thread(cache_known_misses, unresolved_misses)
+    if fallback_resolved_features:
+        await asyncio.to_thread(
+            cache_track_features, fallback_resolved_features, "fallback_replacement"
+        )
 
     features_by_id = {
         row["id"]: row for row in features if isinstance(row, dict) and row.get("id")
     }
     features = list(features_by_id.values())
-    if features:
-        await asyncio.to_thread(cache_track_features, features, "pipeline_result")
 
     if resolved_count > 0:
         print(f"Fallback resolved {resolved_count} missing tracks via Spotify search.")
