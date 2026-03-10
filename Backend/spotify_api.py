@@ -53,6 +53,14 @@ _SPOTIFY_SESSION = None
 _SPOTIFY_SESSION_LOCK = threading.Lock()
 
 
+def _trim_response_text(text: str, max_length: int = 300) -> str:
+    """Return one-line response preview to keep logs readable."""
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3] + "..."
+
+
 def _reserve_spotify_slot_delay() -> float:
     """Reserve the next Spotify request slot and return required sleep time."""
     global _SPOTIFY_NEXT_ALLOWED_TS  # pylint: disable=global-statement
@@ -182,7 +190,25 @@ def spotify_request(
             continue
 
         if response.status_code >= 400:
-            print(f"Spotify API request error: {response.status_code}, {response.text}")
+            response_preview = _trim_response_text(response.text)
+            print(
+                "Spotify API request error:",
+                f"status={response.status_code},",
+                f"method={method},",
+                f"endpoint={endpoint},",
+                f"response={response_preview}",
+            )
+            if (
+                response.status_code == 403
+                and "insufficient client scope" in response_preview.lower()
+            ):
+                print(
+                    "Spotify scope failure:",
+                    f"method={method},",
+                    f"endpoint={endpoint},",
+                    "hint=Re-authenticate with playlist-modify-public and "
+                    "playlist-modify-private scopes.",
+                )
             return {}
         return response.json()
 
