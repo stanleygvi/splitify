@@ -10,7 +10,7 @@
       {
         "source": "/api/**",
         "run": {
-          "serviceId": "splitify-backend-staging",
+          "serviceId": "splitify-backend",
           "region": "us-central1"
         }
       },
