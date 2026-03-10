@@ -1,5 +1,6 @@
 """Postgres-backed shared cache for track audio features and known misses."""
 
+from collections import OrderedDict
 import json
 import os
 import re
@@ -43,6 +44,15 @@ def _parse_pool_size(env_name: str, default_value: int) -> int:
     return max(1, parsed)
 
 
+def _parse_non_negative_int(env_name: str, default_value: int) -> int:
+    """Parse non-negative integer setting with fallback."""
+    raw_value = os.getenv(env_name, str(default_value)).strip()
+    if not raw_value.lstrip("-").isdigit():
+        return default_value
+    parsed = int(raw_value)
+    return max(0, parsed)
+
+
 CACHE_TTL_SECONDS = _parse_ttl_seconds(
     "TRACK_CACHE_TTL_SECONDS", 30 * 24 * 60 * 60
 )
@@ -51,11 +61,18 @@ MISS_TTL_SECONDS = _parse_ttl_seconds(
 )
 POOL_MIN_CONN = _parse_pool_size("TRACK_CACHE_DB_POOL_MIN", DEFAULT_POOL_MIN_CONN)
 POOL_MAX_CONN = _parse_pool_size("TRACK_CACHE_DB_POOL_MAX", DEFAULT_POOL_MAX_CONN)
+L1_CACHE_MAX_ENTRIES = _parse_non_negative_int("TRACK_CACHE_L1_MAX_ENTRIES", 25000)
+L1_FEATURE_TTL_SECONDS = _parse_non_negative_int("TRACK_CACHE_L1_FEATURE_TTL_SECONDS", 0)
+L1_MISS_TTL_SECONDS = _parse_non_negative_int(
+    "TRACK_CACHE_L1_MISS_TTL_SECONDS", 24 * 60 * 60
+)
 
 _POOL = None
 _POOL_LOCK = threading.Lock()
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
+_L1_CACHE: OrderedDict[str, tuple[bool, Any, float | None]] = OrderedDict()
+_L1_CACHE_LOCK = threading.Lock()
 
 
 def _cache_enabled() -> bool:
@@ -66,6 +83,95 @@ def _cache_enabled() -> bool:
 def _is_valid_track_id(track_id: str | None) -> bool:
     """Return whether a track ID matches Spotify base62 format."""
     return bool(track_id) and bool(SPOTIFY_TRACK_ID_PATTERN.fullmatch(track_id))
+
+
+def _l1_cache_enabled() -> bool:
+    """Return whether process-local L1 cache is enabled."""
+    return L1_CACHE_MAX_ENTRIES > 0
+
+
+def _l1_expiry_from_ttl(ttl_seconds: int) -> float | None:
+    """Return absolute expiry for a TTL, or None for non-expiring entries."""
+    if ttl_seconds <= 0:
+        return None
+    return time.time() + ttl_seconds
+
+
+def _l1_insert_entry_locked(
+    track_id: str, known_missing: bool, payload: Any, expires_at: float | None
+) -> None:
+    """Upsert one L1 entry and enforce global max-entry cap."""
+    _L1_CACHE[track_id] = (known_missing, payload, expires_at)
+    _L1_CACHE.move_to_end(track_id)
+    while len(_L1_CACHE) > L1_CACHE_MAX_ENTRIES:
+        _L1_CACHE.popitem(last=False)
+
+
+def _l1_store_features(features_by_track_id: dict[str, dict[str, Any]]) -> None:
+    """Store feature payloads in L1 cache."""
+    if not _l1_cache_enabled() or not features_by_track_id:
+        return
+    expires_at = _l1_expiry_from_ttl(L1_FEATURE_TTL_SECONDS)
+    with _L1_CACHE_LOCK:
+        for track_id, payload in features_by_track_id.items():
+            normalized = dict(payload)
+            normalized["id"] = track_id
+            _l1_insert_entry_locked(track_id, False, normalized, expires_at)
+
+
+def _l1_store_misses(miss_reasons_by_track_id: dict[str, str]) -> None:
+    """Store known-miss reasons in L1 cache."""
+    if not _l1_cache_enabled() or not miss_reasons_by_track_id:
+        return
+    expires_at = _l1_expiry_from_ttl(L1_MISS_TTL_SECONDS)
+    with _L1_CACHE_LOCK:
+        for track_id, reason in miss_reasons_by_track_id.items():
+            reason_text = reason if reason else "known_missing_cached"
+            _l1_insert_entry_locked(track_id, True, reason_text, expires_at)
+
+
+def _l1_lookup_track_ids(
+    track_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str], list[str]]:
+    """Return L1 hits and unresolved IDs for DB fallback lookup."""
+    if not _l1_cache_enabled() or not track_ids:
+        return {}, {}, track_ids
+
+    now = time.time()
+    features_by_track_id: dict[str, dict[str, Any]] = {}
+    misses_by_track_id: dict[str, str] = {}
+    unresolved_track_ids: list[str] = []
+
+    with _L1_CACHE_LOCK:
+        for track_id in track_ids:
+            cached_entry = _L1_CACHE.get(track_id)
+            if cached_entry is None:
+                unresolved_track_ids.append(track_id)
+                continue
+
+            known_missing, payload, expires_at = cached_entry
+            if expires_at is not None and expires_at < now:
+                _L1_CACHE.pop(track_id, None)
+                unresolved_track_ids.append(track_id)
+                continue
+
+            _L1_CACHE.move_to_end(track_id)
+            if known_missing:
+                misses_by_track_id[track_id] = (
+                    str(payload) if payload else "known_missing_cached"
+                )
+                continue
+
+            if not isinstance(payload, dict):
+                _L1_CACHE.pop(track_id, None)
+                unresolved_track_ids.append(track_id)
+                continue
+
+            normalized = dict(payload)
+            normalized["id"] = track_id
+            features_by_track_id[track_id] = normalized
+
+    return features_by_track_id, misses_by_track_id, unresolved_track_ids
 
 
 def _pool_bounds() -> tuple[int, int]:
@@ -167,7 +273,7 @@ def get_cached_track_features(
     track_ids: list[str],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Return cached features and known-miss reasons for provided track IDs."""
-    if not _cache_enabled() or not track_ids:
+    if not track_ids:
         return {}, {}
     valid_track_ids = [
         track_id for track_id in track_ids if _is_valid_track_id(track_id)
@@ -175,17 +281,23 @@ def get_cached_track_features(
     if not valid_track_ids:
         return {}, {}
 
+    features_by_track_id, misses_by_track_id, unresolved_track_ids = _l1_lookup_track_ids(
+        valid_track_ids
+    )
+    if not unresolved_track_ids or not _cache_enabled():
+        return features_by_track_id, misses_by_track_id
+
     _ensure_schema()
     now = int(time.time())
     min_feature_updated_at = now - CACHE_TTL_SECONDS
     min_miss_updated_at = now - MISS_TTL_SECONDS
 
-    features_by_track_id: dict[str, dict[str, Any]] = {}
-    misses_by_track_id: dict[str, str] = {}
+    db_features_by_track_id: dict[str, dict[str, Any]] = {}
+    db_misses_by_track_id: dict[str, str] = {}
 
     pool, connection = _acquire_connection()
     if connection is None:
-        return {}, {}
+        return features_by_track_id, misses_by_track_id
     try:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -199,14 +311,17 @@ def get_cached_track_features(
                     (known_missing = TRUE AND updated_at >= %s)
                 )
                 """,
-                (valid_track_ids, min_feature_updated_at, min_miss_updated_at),
+                (unresolved_track_ids, min_feature_updated_at, min_miss_updated_at),
             )
             rows = cursor.fetchall()
             for track_id, payload_json, known_missing, miss_reason in rows:
+                track_id_text = str(track_id)
                 if known_missing:
-                    misses_by_track_id[str(track_id)] = (
+                    miss_reason_text = (
                         str(miss_reason) if miss_reason else "known_missing_cached"
                     )
+                    misses_by_track_id[track_id_text] = miss_reason_text
+                    db_misses_by_track_id[track_id_text] = miss_reason_text
                     continue
 
                 if not payload_json:
@@ -216,11 +331,14 @@ def get_cached_track_features(
                 except (TypeError, json.JSONDecodeError):
                     continue
                 if isinstance(payload, dict):
-                    payload["id"] = str(track_id)
-                    features_by_track_id[str(track_id)] = payload
+                    payload["id"] = track_id_text
+                    features_by_track_id[track_id_text] = payload
+                    db_features_by_track_id[track_id_text] = payload
     finally:
         _release_connection(pool, connection)
 
+    _l1_store_features(db_features_by_track_id)
+    _l1_store_misses(db_misses_by_track_id)
     return features_by_track_id, misses_by_track_id
 
 
@@ -228,11 +346,12 @@ def cache_track_features(
     features: list[dict[str, Any]], source: str = "reccobeats"
 ) -> None:
     """Upsert resolved track features into cache."""
-    if not _cache_enabled() or not features:
+    if not features:
         return
 
-    _ensure_schema()
-    now = int(time.time())
+    db_cache_enabled = _cache_enabled()
+    now = int(time.time()) if db_cache_enabled else 0
+    l1_features_by_track_id: dict[str, dict[str, Any]] = {}
     rows: list[tuple[str, str, bool, str, str, int]] = []
     for feature in features:
         track_id = feature.get("id")
@@ -240,18 +359,23 @@ def cache_track_features(
             continue
         payload = dict(feature)
         payload["id"] = str(track_id)
-        rows.append(
-            (
-                str(track_id),
-                json.dumps(payload, separators=(",", ":")),
-                False,
-                "",
-                source,
-                now,
+        l1_features_by_track_id[str(track_id)] = payload
+        if db_cache_enabled:
+            rows.append(
+                (
+                    str(track_id),
+                    json.dumps(payload, separators=(",", ":")),
+                    False,
+                    "",
+                    source,
+                    now,
+                )
             )
-        )
-    if not rows:
+    _l1_store_features(l1_features_by_track_id)
+    if not db_cache_enabled or not rows:
         return
+
+    _ensure_schema()
 
     pool, connection = _acquire_connection()
     if connection is None:
@@ -283,15 +407,24 @@ def cache_track_features(
 
 def cache_known_misses(miss_reasons_by_track_id: dict[str, str]) -> None:
     """Upsert known misses so future runs can skip repeated failed lookups."""
-    if not _cache_enabled() or not miss_reasons_by_track_id:
+    if not miss_reasons_by_track_id:
+        return
+
+    db_cache_enabled = _cache_enabled()
+    valid_miss_reasons = {
+        track_id: str(reason)
+        for track_id, reason in miss_reasons_by_track_id.items()
+        if _is_valid_track_id(track_id)
+    }
+    _l1_store_misses(valid_miss_reasons)
+    if not db_cache_enabled:
         return
 
     _ensure_schema()
     now = int(time.time())
     rows = [
         (track_id, None, True, reason, "known_miss", now)
-        for track_id, reason in miss_reasons_by_track_id.items()
-        if _is_valid_track_id(track_id)
+        for track_id, reason in valid_miss_reasons.items()
     ]
     if not rows:
         return

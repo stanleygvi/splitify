@@ -8,29 +8,67 @@ import time
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 
 SPOTIFY_API_URL = "https://api.spotify.com/v1"
 RECCOBEATS_API_URL = "https://api.reccobeats.com/v1"
 SPOTIFY_TRACK_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{22}$")
 SPOTIFY_TRACK_PATH_PATTERN = re.compile(r"/track/([A-Za-z0-9]{22})")
 REQUEST_TIMEOUT_SECONDS = 15
-SPOTIFY_REQUEST_INTERVAL_SECONDS = float(os.getenv("SPOTIFY_REQUEST_INTERVAL_SECONDS", "0.25"))
-SPOTIFY_MAX_RETRY_ATTEMPTS = int(os.getenv("SPOTIFY_MAX_RETRY_ATTEMPTS", "3"))
-SPOTIFY_RETRY_BASE_SECONDS = float(os.getenv("SPOTIFY_RETRY_BASE_SECONDS", "0.75"))
 SPOTIFY_RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+
+
+def _env_non_negative_float(name: str, default_value: float) -> float:
+    """Parse a non-negative float env setting with fallback."""
+    raw_value = os.getenv(name, str(default_value))
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return default_value
+    return max(0.0, parsed)
+
+
+def _env_positive_int(name: str, default_value: int) -> int:
+    """Parse a positive integer env setting with fallback."""
+    raw_value = os.getenv(name, str(default_value))
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default_value
+    return max(1, parsed)
+
+
+SPOTIFY_REQUEST_INTERVAL_SECONDS = _env_non_negative_float(
+    "SPOTIFY_REQUEST_INTERVAL_SECONDS", 0.05
+)
+SPOTIFY_MAX_RETRY_ATTEMPTS = _env_positive_int("SPOTIFY_MAX_RETRY_ATTEMPTS", 3)
+SPOTIFY_RETRY_BASE_SECONDS = _env_non_negative_float("SPOTIFY_RETRY_BASE_SECONDS", 0.75)
+SPOTIFY_MAX_INFLIGHT_REQUESTS = _env_positive_int("SPOTIFY_MAX_INFLIGHT_REQUESTS", 12)
+SPOTIFY_POOL_CONNECTIONS = _env_positive_int("SPOTIFY_POOL_CONNECTIONS", 32)
+SPOTIFY_POOL_MAXSIZE = _env_positive_int("SPOTIFY_POOL_MAXSIZE", 64)
 _SPOTIFY_RATE_LIMIT_LOCK = threading.Lock()
 _SPOTIFY_NEXT_ALLOWED_TS = 0.0
+_SPOTIFY_INFLIGHT_SEMAPHORE = threading.BoundedSemaphore(SPOTIFY_MAX_INFLIGHT_REQUESTS)
+_SPOTIFY_SESSION = None
+_SPOTIFY_SESSION_LOCK = threading.Lock()
 
 
-def _wait_for_spotify_slot():
-    """Global per-process pacing for Spotify API requests."""
+def _trim_response_text(text: str, max_length: int = 300) -> str:
+    """Return one-line response preview to keep logs readable."""
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3] + "..."
+
+
+def _reserve_spotify_slot_delay() -> float:
+    """Reserve the next Spotify request slot and return required sleep time."""
     global _SPOTIFY_NEXT_ALLOWED_TS  # pylint: disable=global-statement
     with _SPOTIFY_RATE_LIMIT_LOCK:
         now = time.time()
-        if now < _SPOTIFY_NEXT_ALLOWED_TS:
-            time.sleep(_SPOTIFY_NEXT_ALLOWED_TS - now)
-            now = time.time()
-        _SPOTIFY_NEXT_ALLOWED_TS = now + SPOTIFY_REQUEST_INTERVAL_SECONDS
+        reserved_ts = max(now, _SPOTIFY_NEXT_ALLOWED_TS)
+        _SPOTIFY_NEXT_ALLOWED_TS = reserved_ts + SPOTIFY_REQUEST_INTERVAL_SECONDS
+    return max(0.0, reserved_ts - now)
 
 
 def _apply_spotify_retry_after(retry_after_seconds: int):
@@ -40,6 +78,37 @@ def _apply_spotify_retry_after(retry_after_seconds: int):
         _SPOTIFY_NEXT_ALLOWED_TS = max(
             _SPOTIFY_NEXT_ALLOWED_TS, time.time() + max(retry_after_seconds, 1)
         )
+
+
+def _parse_retry_after_seconds(value) -> int:
+    """Parse Retry-After seconds safely with a minimum of one second."""
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, parsed)
+
+
+def _get_spotify_session() -> requests.Session:
+    """Return process-wide pooled HTTP session for Spotify requests."""
+    global _SPOTIFY_SESSION  # pylint: disable=global-statement
+    if _SPOTIFY_SESSION is not None:
+        return _SPOTIFY_SESSION
+
+    with _SPOTIFY_SESSION_LOCK:
+        if _SPOTIFY_SESSION is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(
+                pool_connections=SPOTIFY_POOL_CONNECTIONS,
+                pool_maxsize=SPOTIFY_POOL_MAXSIZE,
+                pool_block=True,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _SPOTIFY_SESSION = session
+
+    assert _SPOTIFY_SESSION is not None
+    return _SPOTIFY_SESSION
 
 
 def get_spotify_redirect_uri() -> str:
@@ -63,82 +132,85 @@ def spotify_request(
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json",
     }
+    session = _get_spotify_session()
 
-    _wait_for_spotify_slot()
+    current_retry_attempt = retry_attempt
 
-    try:
-        response = requests.request(
-            method,
-            url,
-            headers=headers,
-            params=params,
-            data=data,
-            json=json_data,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as error:
-        if retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS:
-            sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** retry_attempt)
+    while True:
+        slot_delay_seconds = _reserve_spotify_slot_delay()
+        if slot_delay_seconds > 0:
+            time.sleep(slot_delay_seconds)
+
+        try:
+            with _SPOTIFY_INFLIGHT_SEMAPHORE:
+                response = session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    data=data,
+                    json=json_data,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+        except requests.RequestException as error:
+            if current_retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS:
+                sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** current_retry_attempt)
+                print(
+                    "Spotify request network error. Retrying:",
+                    f"attempt={current_retry_attempt + 1},",
+                    f"sleep={sleep_seconds:.2f}s,",
+                    f"error={error}",
+                )
+                current_retry_attempt += 1
+                time.sleep(sleep_seconds)
+                continue
+            print(f"Spotify request network error (final): {error}")
+            return {}
+
+        if response.status_code == 429:  # Rate limited
+            retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+            print(f"Rate limited. Retrying after {retry_after} seconds.")
+            _apply_spotify_retry_after(retry_after)
+            time.sleep(retry_after)
+            continue
+
+        if (
+            response.status_code in SPOTIFY_RETRYABLE_STATUS_CODES
+            and current_retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS
+        ):
+            sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** current_retry_attempt)
             print(
-                "Spotify request network error. Retrying:",
-                f"attempt={retry_attempt + 1},",
-                f"sleep={sleep_seconds:.2f}s,",
-                f"error={error}",
+                "Spotify retryable error. Retrying:",
+                f"status={response.status_code},",
+                f"attempt={current_retry_attempt + 1},",
+                f"sleep={sleep_seconds:.2f}s",
             )
+            current_retry_attempt += 1
             time.sleep(sleep_seconds)
-            return spotify_request(
-                method,
-                endpoint,
-                auth_token,
-                params,
-                data,
-                json_data,
-                retry_attempt + 1,
+            continue
+
+        if response.status_code >= 400:
+            response_preview = _trim_response_text(response.text)
+            print(
+                "Spotify API request error:",
+                f"status={response.status_code},",
+                f"method={method},",
+                f"endpoint={endpoint},",
+                f"response={response_preview}",
             )
-        print(f"Spotify request network error (final): {error}")
-        return {}
-
-    if response.status_code == 429:  # Rate limited
-        retry_after = int(response.headers.get("Retry-After", 1))
-        print(f"Rate limited. Retrying after {retry_after} seconds.")
-        _apply_spotify_retry_after(retry_after)
-        time.sleep(retry_after)
-        return spotify_request(
-            method,
-            endpoint,
-            auth_token,
-            params,
-            data,
-            json_data,
-            retry_attempt,
-        )
-
-    if (
-        response.status_code in SPOTIFY_RETRYABLE_STATUS_CODES
-        and retry_attempt < SPOTIFY_MAX_RETRY_ATTEMPTS
-    ):
-        sleep_seconds = SPOTIFY_RETRY_BASE_SECONDS * (2 ** retry_attempt)
-        print(
-            "Spotify retryable error. Retrying:",
-            f"status={response.status_code},",
-            f"attempt={retry_attempt + 1},",
-            f"sleep={sleep_seconds:.2f}s",
-        )
-        time.sleep(sleep_seconds)
-        return spotify_request(
-            method,
-            endpoint,
-            auth_token,
-            params,
-            data,
-            json_data,
-            retry_attempt + 1,
-        )
-
-    if response.status_code >= 400:
-        print(f"Spotify API request error: {response.status_code}, {response.text}")
-        return {}
-    return response.json()
+            if (
+                response.status_code == 403
+                and "insufficient client scope" in response_preview.lower()
+            ):
+                print(
+                    "Spotify scope failure:",
+                    f"method={method},",
+                    f"endpoint={endpoint},",
+                    "hint=Re-authenticate with playlist-modify-public and "
+                    "playlist-modify-private scopes.",
+                )
+            return {}
+        return response.json()
 
 
 def reccobeats_request(method, endpoint, params=None):
@@ -263,13 +335,16 @@ def get_playlist_name(playlist_id, auth_token):
     return ""
 
 
-async def get_playlist_children(start_index, playlist_id, auth_token):
+async def get_playlist_children(start_index, playlist_id, auth_token, include_total=False):
     """Return one page of playlist tracks using offset pagination."""
+    fields = "items(track(id))"
+    if include_total:
+        fields = "total,items(track(id))"
     endpoint = f"/playlists/{playlist_id}/tracks"
     params = {
         "offset": start_index,
         "limit": 100,
-        "fields": "items(track(id,uri))",
+        "fields": fields,
     }
     response = await asyncio.to_thread(
         spotify_request, "GET", endpoint, auth_token, params, None, None

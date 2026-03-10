@@ -24,6 +24,11 @@ try:
     )
     from Backend.playlist_processing import process_all
     from Backend.helpers import generate_random_string
+    from Backend.job_status_store import (
+        set_job_state,
+        get_job_state,
+        prune_finished_jobs_older_than,
+    )
 except ModuleNotFoundError:
     from spotify_api import (  # type: ignore
         is_access_token_valid,
@@ -35,6 +40,11 @@ except ModuleNotFoundError:
     )
     from playlist_processing import process_all  # type: ignore
     from helpers import generate_random_string  # type: ignore
+    from job_status_store import (  # type: ignore
+        set_job_state,
+        get_job_state,
+        prune_finished_jobs_older_than,
+    )
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -44,6 +54,36 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+REQUIRED_SPOTIFY_SCOPES = {
+    "user-read-private",
+    "playlist-read-private",
+    "playlist-modify-public",
+    "playlist-modify-private",
+}
+SPOTIFY_LOGIN_SCOPE = (
+    "user-read-private playlist-read-private "
+    "playlist-modify-public playlist-modify-private"
+)
+
+
+def _parse_scope_set(scope_value) -> set[str]:
+    """Normalize stored Spotify scope value into a scope-name set."""
+    if isinstance(scope_value, str):
+        tokens = scope_value.replace(",", " ").split()
+        return {token.strip() for token in tokens if token.strip()}
+
+    if isinstance(scope_value, list):
+        return {str(token).strip() for token in scope_value if str(token).strip()}
+
+    return set()
+
+
+def _missing_required_scopes() -> list[str]:
+    """Return required Spotify scopes missing from current session."""
+    granted_scopes = _parse_scope_set(session.get("auth_scopes"))
+    return sorted(REQUIRED_SPOTIFY_SCOPES - granted_scopes)
 
 
 frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:3000").rstrip("/")
@@ -78,8 +118,6 @@ CORS(
 )
 
 JOB_STATUS_TTL_SECONDS = int(os.getenv("JOB_STATUS_TTL_SECONDS", "21600"))
-_PROCESSING_JOBS: dict[str, dict[str, object]] = {}
-_PROCESSING_JOBS_LOCK = threading.Lock()
 
 
 def get_auth_token_from_request():
@@ -88,24 +126,14 @@ def get_auth_token_from_request():
 
 
 def _prune_old_jobs():
-    """Drop old completed jobs to keep in-memory status map bounded."""
+    """Drop old completed jobs to keep status store bounded."""
     cutoff = time.time() - JOB_STATUS_TTL_SECONDS
-    with _PROCESSING_JOBS_LOCK:
-        old_job_ids = [
-            job_id
-            for job_id, payload in _PROCESSING_JOBS.items()
-            if payload.get("finished_at") and float(payload["finished_at"]) < cutoff
-        ]
-        for job_id in old_job_ids:
-            _PROCESSING_JOBS.pop(job_id, None)
+    prune_finished_jobs_older_than(cutoff)
 
 
 def _set_job_state(job_id: str, **fields):
-    """Update one job status entry in a thread-safe way."""
-    with _PROCESSING_JOBS_LOCK:
-        payload = _PROCESSING_JOBS.get(job_id, {})
-        payload.update(fields)
-        _PROCESSING_JOBS[job_id] = payload
+    """Update one job status entry in shared status store."""
+    set_job_state(job_id, **fields)
 
 
 def _run_process_playlist_job(job_id: str, auth_token: str, playlist_ids: list[str]):
@@ -151,6 +179,14 @@ def login_handler():
     refresh_token = session.get("refresh_token")
 
     if uid:
+        missing_scopes = _missing_required_scopes()
+        if missing_scopes:
+            print(
+                "Session missing required Spotify scopes.",
+                f"missing={','.join(missing_scopes)}",
+            )
+            return redirect_to_spotify_login()
+
         if not auth_token:
             return redirect_to_spotify_login()
 
@@ -178,12 +214,11 @@ def redirect_to_spotify_login():
 
     state = generate_random_string(16)
     session["oauth_state"] = state
-    scope = "user-read-private playlist-modify-public playlist-read-private"
 
     params = {
         "response_type": "code",
         "client_id": client_id,
-        "scope": scope,
+        "scope": SPOTIFY_LOGIN_SCOPE,
         "show_dialog": "true",
         "redirect_uri": redirect_uri,
         "state": state,
@@ -220,6 +255,7 @@ def callback_handler():
     session["uid"] = user_id
     session["auth_token"] = auth_token
     session["refresh_token"] = token_data.get("refresh_token")
+    session["auth_scopes"] = sorted(_parse_scope_set(token_data.get("scope", "")))
 
     return redirect(f"{frontend_url}/input-playlist")
 
@@ -248,8 +284,21 @@ def process_playlist_handler():
     """Start async processing job for selected playlists."""
     auth_token = get_auth_token_from_request()
 
-    if not auth_token or not is_access_token_valid(auth_token):
+    if not auth_token:
         return "Authorization required", 401
+
+    missing_scopes = _missing_required_scopes()
+    if missing_scopes:
+        return (
+            jsonify(
+                {
+                    "Code": 403,
+                    "Error": "Insufficient Spotify scopes. Please re-login.",
+                    "missingScopes": missing_scopes,
+                }
+            ),
+            403,
+        )
 
     assert request.json
     playlist_ids = request.json.get("playlistIds", [])
@@ -281,8 +330,7 @@ def process_playlist_handler():
 @app.route("/api/process-playlist-status/<job_id>")
 def process_playlist_status_handler(job_id):
     """Return current status for an async playlist processing job."""
-    with _PROCESSING_JOBS_LOCK:
-        payload = _PROCESSING_JOBS.get(job_id)
+    payload = get_job_state(job_id)
     if not payload:
         return jsonify({"Code": 404, "Error": "Job not found"}), 404
     return jsonify(payload), 200
