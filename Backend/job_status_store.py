@@ -1,5 +1,8 @@
 """Shared job-status persistence for async playlist processing jobs."""
 
+# Reuses connection-pool/schema patterns from track_cache intentionally.
+# pylint: disable=duplicate-code
+
 import json
 import os
 import threading
