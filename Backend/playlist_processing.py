@@ -57,9 +57,9 @@ def _env_positive_int(name: str, default_value: int) -> int:
     return parsed if parsed > 0 else 1
 
 
-FETCH_PAGE_CONCURRENCY = _env_positive_int("PLAYLIST_FETCH_PAGE_CONCURRENCY", 8)
-CREATE_PLAYLIST_CONCURRENCY = _env_positive_int("PLAYLIST_CREATE_CONCURRENCY", 4)
-ADD_SONGS_CONCURRENCY = _env_positive_int("PLAYLIST_ADD_CONCURRENCY", 12)
+FETCH_PAGE_CONCURRENCY = _env_positive_int("PLAYLIST_FETCH_PAGE_CONCURRENCY", 12)
+CREATE_PLAYLIST_CONCURRENCY = _env_positive_int("PLAYLIST_CREATE_CONCURRENCY", 6)
+ADD_SONGS_CONCURRENCY = _env_positive_int("PLAYLIST_ADD_CONCURRENCY", 16)
 
 
 def log_step_time(step_name, start_time):
@@ -83,7 +83,8 @@ async def get_playlist_track_ids(auth_token, playlist_id):
     slices = calc_slices(total_tracks)
     responses = [first_page_response] if first_page_response else []
     offsets = list(range(100, slices * 100, 100))
-    semaphore = asyncio.Semaphore(FETCH_PAGE_CONCURRENCY)
+    fetch_concurrency = max(1, min(FETCH_PAGE_CONCURRENCY, len(offsets) or 1))
+    semaphore = asyncio.Semaphore(fetch_concurrency)
 
     async def fetch_page(offset):
         async with semaphore:
@@ -186,8 +187,13 @@ async def create_and_populate_cluster_playlists(
         return
 
     pipeline_start = time.time()
-    create_semaphore = asyncio.Semaphore(CREATE_PLAYLIST_CONCURRENCY)
-    add_semaphore = asyncio.Semaphore(ADD_SONGS_CONCURRENCY)
+    create_concurrency = max(1, min(CREATE_PLAYLIST_CONCURRENCY, len(cluster_candidates)))
+    create_semaphore = asyncio.Semaphore(create_concurrency)
+    total_add_jobs = sum(
+        calc_slices(len(candidate["track_ids"])) for candidate in cluster_candidates
+    )
+    add_concurrency = max(1, min(ADD_SONGS_CONCURRENCY, total_add_jobs or 1))
+    add_semaphore = asyncio.Semaphore(add_concurrency)
 
     async def process_cluster(candidate):
         create_duration = 0.0
@@ -261,6 +267,8 @@ async def create_and_populate_cluster_playlists(
         "Playlist write stats:",
         f"clusters_considered={len(sorted_clusters)},",
         f"clusters_created={clusters_created},",
+        f"create_concurrency={create_concurrency},",
+        f"add_concurrency={add_concurrency},",
         f"create_calls={create_calls},",
         f"create_time={create_duration:.2f}s,",
         f"add_calls={add_calls},",

@@ -311,9 +311,9 @@ def get_playlist_name(playlist_id, auth_token):
 
 async def get_playlist_children(start_index, playlist_id, auth_token, include_total=False):
     """Return one page of playlist tracks using offset pagination."""
-    fields = "items(track(id,uri))"
+    fields = "items(track(id))"
     if include_total:
-        fields = "total,items(track(id,uri))"
+        fields = "total,items(track(id))"
     endpoint = f"/playlists/{playlist_id}/tracks"
     params = {
         "offset": start_index,
