@@ -23,6 +23,7 @@ try:
         get_spotify_redirect_uri,
     )
     from Backend.playlist_processing import process_all
+    from Backend.grouping import normalize_feature_weights
     from Backend.helpers import generate_random_string
     from Backend.job_status_store import (
         set_job_state,
@@ -39,6 +40,7 @@ except ModuleNotFoundError:
         get_spotify_redirect_uri,
     )
     from playlist_processing import process_all  # type: ignore
+    from grouping import normalize_feature_weights  # type: ignore
     from helpers import generate_random_string  # type: ignore
     from job_status_store import (  # type: ignore
         set_job_state,
@@ -120,9 +122,53 @@ CORS(
 JOB_STATUS_TTL_SECONDS = int(os.getenv("JOB_STATUS_TTL_SECONDS", "21600"))
 
 
-def get_auth_token_from_request():
-    """Return auth token from request cookies, falling back to server session."""
-    return session.get("auth_token") or request.cookies.get("auth_token")
+def _clear_auth_session():
+    """Clear server-side auth/session values for a stale login state."""
+    session.pop("uid", None)
+    session.pop("auth_token", None)
+    session.pop("refresh_token", None)
+    session.pop("auth_scopes", None)
+
+
+def _unauthorized_session_response(message: str = "Spotify session expired. Please log in again."):
+    """Return standardized 401 payload for expired/missing auth sessions."""
+    return (
+        jsonify(
+            {
+                "Code": 401,
+                "Error": message,
+                "reauth": True,
+            }
+        ),
+        401,
+    )
+
+
+def _resolve_active_auth_token():
+    """
+    Return a valid Spotify auth token for current request.
+
+    Attempts refresh when session token is expired. Returns tuple:
+      (auth_token, error_response_or_none)
+    """
+    auth_token = session.get("auth_token")
+    refresh_token = session.get("refresh_token")
+
+    if not auth_token:
+        _clear_auth_session()
+        return None, _unauthorized_session_response("Authorization required.")
+
+    if is_access_token_valid(auth_token):
+        return auth_token, None
+
+    if refresh_token:
+        refreshed_token = refresh_access_token(refresh_token)
+        if refreshed_token:
+            session["auth_token"] = refreshed_token
+            return refreshed_token, None
+
+    _clear_auth_session()
+    return None, _unauthorized_session_response()
 
 
 def _prune_old_jobs():
@@ -136,11 +182,54 @@ def _set_job_state(job_id: str, **fields):
     set_job_state(job_id, **fields)
 
 
-def _run_process_playlist_job(job_id: str, auth_token: str, playlist_ids: list[str]):
+def _run_process_playlist_job(
+    job_id: str,
+    auth_token: str,
+    playlist_ids: list[str],
+    feature_weights: dict[str, float] | None = None,
+    split_criterion: str | None = None,
+):
     """Run playlist processing in background and persist status fields."""
+    total_playlists = len(playlist_ids)
+
+    def _emit_progress(
+        completed_playlists: int,
+        total_playlists: int,
+        failed_playlists: int = 0,
+        last_completed_playlist_id: str | None = None,
+        last_completed_playlist_name: str | None = None,
+    ):
+        safe_total = max(1, int(total_playlists))
+        raw_percent = int(round((completed_playlists / safe_total) * 100))
+        progress_percent = max(0, min(100, raw_percent))
+        _set_job_state(
+            job_id,
+            completed_playlists=completed_playlists,
+            total_playlists=total_playlists,
+            failed_playlists=failed_playlists,
+            progress_percent=progress_percent,
+            last_completed_playlist_id=last_completed_playlist_id,
+            last_completed_playlist_name=last_completed_playlist_name,
+        )
+
     _set_job_state(job_id, status="running", started_at=time.time())
+    _emit_progress(
+        completed_playlists=0,
+        total_playlists=total_playlists,
+        failed_playlists=0,
+    )
     try:
-        process_all(auth_token, playlist_ids)
+        process_all(
+            auth_token,
+            playlist_ids,
+            feature_weights=feature_weights,
+            split_criterion=split_criterion,
+            progress_callback=_emit_progress,
+        )
+        _emit_progress(
+            completed_playlists=total_playlists,
+            total_playlists=total_playlists,
+        )
         _set_job_state(
             job_id,
             status="succeeded",
@@ -193,6 +282,8 @@ def login_handler():
         if not is_access_token_valid(auth_token):
             if refresh_token:
                 new_auth_token = refresh_access_token(refresh_token)
+                if not new_auth_token:
+                    return redirect_to_spotify_login()
                 session["auth_token"] = new_auth_token
                 auth_token = new_auth_token
             else:
@@ -264,16 +355,17 @@ def callback_handler():
 @app.route("/api/user-playlists")
 def get_playlist_handler():
     """Return current user's Spotify playlists based on auth cookie token."""
-    auth_token = get_auth_token_from_request()
-
-    if not auth_token:
-        print(f"NO AUTH: {auth_token}")
-        return {"Code": 401, "Error": "Authorization token required"}
+    auth_token, auth_error = _resolve_active_auth_token()
+    if auth_error:
+        return auth_error
 
     playlists = get_all_playlists(auth_token)
 
     if not playlists:
-        return {"Code": 500, "Error": "Failed to get playlists"}
+        if not is_access_token_valid(auth_token):
+            _clear_auth_session()
+            return _unauthorized_session_response()
+        return jsonify({"Code": 502, "Error": "Failed to get playlists"}), 502
 
     return jsonify(playlists)
 
@@ -282,10 +374,9 @@ def get_playlist_handler():
 @app.route("/api/process-playlist", methods=["POST"])
 def process_playlist_handler():
     """Start async processing job for selected playlists."""
-    auth_token = get_auth_token_from_request()
-
-    if not auth_token:
-        return "Authorization required", 401
+    auth_token, auth_error = _resolve_active_auth_token()
+    if auth_error:
+        return auth_error
 
     missing_scopes = _missing_required_scopes()
     if missing_scopes:
@@ -302,9 +393,31 @@ def process_playlist_handler():
 
     assert request.json
     playlist_ids = request.json.get("playlistIds", [])
+    feature_weights_payload = request.json.get("featureWeights")
+    split_criterion_payload = request.json.get("splitCriterion")
 
     if not playlist_ids:
         return "No playlist IDs provided", 400
+    if feature_weights_payload is not None and not isinstance(feature_weights_payload, dict):
+        return (
+            jsonify(
+                {
+                    "Code": 400,
+                    "Error": "featureWeights must be an object keyed by feature name.",
+                }
+            ),
+            400,
+        )
+    feature_weights = (
+        normalize_feature_weights(feature_weights_payload)
+        if isinstance(feature_weights_payload, dict)
+        else None
+    )
+    split_criterion = (
+        split_criterion_payload.strip().lower()
+        if isinstance(split_criterion_payload, str) and split_criterion_payload.strip()
+        else None
+    )
 
     _prune_old_jobs()
     job_id = str(uuid.uuid4())
@@ -315,10 +428,18 @@ def process_playlist_handler():
         finished_at=None,
         error=None,
         playlist_count=len(playlist_ids),
+        completed_playlists=0,
+        total_playlists=len(playlist_ids),
+        failed_playlists=0,
+        progress_percent=0,
+        last_completed_playlist_id=None,
+        last_completed_playlist_name=None,
+        feature_weights=feature_weights,
+        split_criterion=split_criterion,
     )
     job_thread = threading.Thread(
         target=_run_process_playlist_job,
-        args=(job_id, auth_token, playlist_ids),
+        args=(job_id, auth_token, playlist_ids, feature_weights, split_criterion),
         daemon=True,
     )
     job_thread.start()

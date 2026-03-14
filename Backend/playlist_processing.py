@@ -61,11 +61,35 @@ FETCH_PAGE_CONCURRENCY = _env_positive_int("PLAYLIST_FETCH_PAGE_CONCURRENCY", 12
 CREATE_PLAYLIST_CONCURRENCY = _env_positive_int("PLAYLIST_CREATE_CONCURRENCY", 6)
 ADD_SONGS_CONCURRENCY = _env_positive_int("PLAYLIST_ADD_CONCURRENCY", 16)
 
+SPLIT_CRITERION_LABELS = {
+    "balanced": "Balanced",
+    "energy": "Energy",
+    "valence": "Mood",
+    "danceability": "Danceability",
+    "tempo": "Tempo",
+    "acousticness": "Acousticness",
+    "instrumentalness": "Instrumental",
+    "speechiness": "Speechiness",
+    "liveness": "Liveness",
+    "loudness": "Loudness",
+    "custom": "Custom",
+}
+
 
 def log_step_time(step_name, start_time):
     """Print elapsed seconds for a named processing step."""
     elapsed_time = time.time() - start_time
     print(f"{step_name} completed in {elapsed_time:.2f} seconds.")
+
+
+def _resolve_split_criterion_label(split_criterion: str | None) -> str | None:
+    """Return friendly split criterion label for playlist naming and metadata."""
+    if not split_criterion:
+        return None
+    normalized = split_criterion.strip().lower()
+    if not normalized:
+        return None
+    return SPLIT_CRITERION_LABELS.get(normalized, normalized.replace("_", " ").title())
 
 
 async def get_playlist_track_ids(auth_token, playlist_id):
@@ -118,11 +142,17 @@ async def get_playlist_track_ids(auth_token, playlist_id):
 
 
 async def create_and_populate_cluster_playlists(
-    clustered_tracks, feature_by_track_id, user_id, auth_token, playlist_name
+    clustered_tracks,
+    feature_by_track_id,
+    user_id,
+    auth_token,
+    playlist_name,
+    split_criterion: str | None = None,
 ):
     """Create playlists for clusters and populate them with grouped tracks."""
     start_time = time.time()
     tracks_by_cluster = defaultdict(list)
+    split_criterion_label = _resolve_split_criterion_label(split_criterion)
 
     for _, row in clustered_tracks.iterrows():
         tracks_by_cluster[int(row["cluster"])].append(row["id"])
@@ -165,17 +195,26 @@ async def create_and_populate_cluster_playlists(
         cluster_trait_summary = build_cluster_trait_summary(
             cluster_means, global_means
         )
-        playlist_title = f"{playlist_name} - {cluster_reason}"
+        if split_criterion_label:
+            playlist_title = f"{playlist_name} [{split_criterion_label}] - {cluster_reason}"
+        else:
+            playlist_title = f"{playlist_name} - {cluster_reason}"
         if len(playlist_title) > 100:
             playlist_title = playlist_title[:97] + "..."
 
+        criterion_sentence = (
+            f"Primary split criterion: {split_criterion_label}. "
+            if split_criterion_label
+            else ""
+        )
         cluster_candidates.append(
             {
                 "cluster_id": cluster_id,
                 "track_ids": valid_cluster_track_ids,
                 "playlist_title": playlist_title,
                 "playlist_description": (
-                    f"Grouped by audio similarity: {cluster_reason}. "
+                    criterion_sentence
+                    + f"Grouped by audio similarity: {cluster_reason}. "
                     f"Trait drivers: {cluster_trait_summary}. "
                     "Made using Splitify: https://splitifytool.com/"
                 ),
@@ -281,7 +320,13 @@ async def create_and_populate_cluster_playlists(
     log_step_time("Creating and populating cluster playlists", start_time)
 
 
-async def process_single_playlist(auth_token, playlist_id, user_id):
+async def process_single_playlist(
+    auth_token,
+    playlist_id,
+    user_id,
+    feature_weights: dict[str, float] | None = None,
+    split_criterion: str | None = None,
+):
     """Split one playlist into cluster playlists."""
     start_time = time.time()
     print(f"Processing {playlist_id}...")
@@ -300,7 +345,11 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
     )
     if not track_ids:
         print(f"No tracks found for playlist {playlist_id}")
-        return
+        return {
+            "playlist_id": playlist_id,
+            "playlist_name": playlist_name,
+            "result": "skipped_no_tracks",
+        }
 
     feature_fetch_start = time.time()
     audio_features, _reccobeats_diagnostics = await get_track_audio_features(
@@ -309,7 +358,11 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
     log_step_time(f"Resolve audio features ({playlist_id})", feature_fetch_start)
     if not audio_features:
         print(f"No audio features available for playlist {playlist_id}")
-        return
+        return {
+            "playlist_id": playlist_id,
+            "playlist_name": playlist_name,
+            "result": "skipped_no_audio_features",
+        }
 
     feature_by_track_id = {
         row["id"]: row for row in audio_features if isinstance(row, dict) and row.get("id")
@@ -318,11 +371,17 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
         removed = len(track_ids) - len(feature_by_track_id)
         print(f"Dropped {removed} tracks without usable unique audio features.")
     cluster_start = time.time()
-    clustered_tracks = await asyncio.to_thread(cluster_df, audio_features)
+    clustered_tracks = await asyncio.to_thread(
+        cluster_df, audio_features, feature_weights
+    )
     log_step_time(f"Cluster tracks ({playlist_id})", cluster_start)
     if clustered_tracks.empty:
         print(f"Failed to cluster tracks for playlist {playlist_id}")
-        return
+        return {
+            "playlist_id": playlist_id,
+            "playlist_name": playlist_name,
+            "result": "failed_clustering",
+        }
     cluster_sizes = clustered_tracks["cluster"].value_counts().tolist()
     print(
         "Cluster distribution stats:",
@@ -333,7 +392,12 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
 
     playlist_write_start = time.time()
     await create_and_populate_cluster_playlists(
-        clustered_tracks, feature_by_track_id, user_id, auth_token, playlist_name
+        clustered_tracks,
+        feature_by_track_id,
+        user_id,
+        auth_token,
+        playlist_name,
+        split_criterion=split_criterion,
     )
     log_step_time(
         f"Write clustered playlists ({playlist_id})",
@@ -341,23 +405,96 @@ async def process_single_playlist(auth_token, playlist_id, user_id):
     )
 
     log_step_time(f"Processing playlist {playlist_id}", start_time)
+    return {
+        "playlist_id": playlist_id,
+        "playlist_name": playlist_name,
+        "result": "succeeded",
+    }
 
 
-async def process_playlists(auth_token, playlist_ids):
+async def process_playlists(
+    auth_token,
+    playlist_ids,
+    feature_weights: dict[str, float] | None = None,
+    split_criterion: str | None = None,
+    progress_callback=None,
+):
     """Process multiple playlists by splitting with K-means clustering."""
     start_time = time.time()
     print(f"Processing {len(playlist_ids)} playlists...")
     user_id = get_user_id(auth_token)
+    total_playlists = len(playlist_ids)
+    completed_playlists = 0
+    failed_playlists = 0
+
+    def emit_progress(
+        last_completed_playlist_id: str | None = None,
+        last_completed_playlist_name: str | None = None,
+    ):
+        if progress_callback is None:
+            return
+        progress_callback(
+            completed_playlists=completed_playlists,
+            total_playlists=total_playlists,
+            failed_playlists=failed_playlists,
+            last_completed_playlist_id=last_completed_playlist_id,
+            last_completed_playlist_name=last_completed_playlist_name,
+        )
+
+    emit_progress()
 
     tasks = [
-        process_single_playlist(auth_token, playlist_id, user_id)
+        asyncio.create_task(
+            process_single_playlist(
+                auth_token,
+                playlist_id,
+                user_id,
+                feature_weights=feature_weights,
+                split_criterion=split_criterion,
+            )
+        )
         for playlist_id in playlist_ids
     ]
-    await asyncio.gather(*tasks)
+    for task in asyncio.as_completed(tasks):
+        last_completed_playlist_id = None
+        last_completed_playlist_name = None
+        try:
+            playlist_result = await task
+            if isinstance(playlist_result, dict):
+                last_completed_playlist_id = playlist_result.get("playlist_id")
+                last_completed_playlist_name = playlist_result.get("playlist_name")
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            failed_playlists += 1
+            print(f"Playlist processing task failed: {error}")
+        finally:
+            completed_playlists += 1
+            emit_progress(
+                last_completed_playlist_id=last_completed_playlist_id,
+                last_completed_playlist_name=last_completed_playlist_name,
+            )
+
+    if failed_playlists > 0:
+        raise RuntimeError(
+            f"{failed_playlists} playlist(s) failed during processing."
+        )
 
     log_step_time("Processing all playlists", start_time)
 
 
-def process_all(auth_token, playlist_ids):
+def process_all(
+    auth_token,
+    playlist_ids,
+    feature_weights: dict[str, float] | None = None,
+    split_criterion: str | None = None,
+    progress_callback=None,
+):
     """Run async playlist processing entrypoint from sync Flask handler."""
-    asyncio.run(process_playlists(auth_token, playlist_ids))
+    asyncio.run(
+        process_playlists(
+            auth_token,
+            playlist_ids,
+            feature_weights=feature_weights,
+            split_criterion=split_criterion,
+            progress_callback=progress_callback,
+        )
+    )
