@@ -7,7 +7,7 @@
   align-items: center;
   justify-content: center;
   font-size: calc(10px + 2vmin);
-  color: white;
+  color: #e9f2ee;
 }
 
 .app-header {
@@ -23,7 +23,7 @@
   font-size: 2.5em;
   margin-bottom: 20px; /* Space between title and button */
   font-weight: 500; /* Semi-bold font weight */
-  color: #FFFFFF;
+  color: #f1f7f4;
 }
 
 .spotify-auth-btn {
@@ -32,7 +32,7 @@
   border: none;
   border-radius: 25px;  /* Rounded edges */
   background: linear-gradient(to right, #1db954, #1ed760); /* Gradient for depth */
-  color: white;
+  color: #f6fbf8;
   font-weight: 700;  /* Bold font weight */
   font-size: 1.1em;
   letter-spacing: 1.2px;  /* Slight letter spacing */

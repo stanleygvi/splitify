@@ -1,6 +1,7 @@
 """Clustering utilities for grouping tracks by audio feature similarity."""
 
 import os
+import math
 
 import numpy as np
 from sklearn.metrics import pairwise_distances
@@ -40,6 +41,8 @@ FEATURE_WEIGHTS = {
     "tempo": 0.85,
     "valence": 1.55,
 }
+MIN_FEATURE_WEIGHT = 0.0
+MAX_FEATURE_WEIGHT = 3.0
 
 
 def _env_positive_int(name: str, default_value: int) -> int:
@@ -67,6 +70,26 @@ LARGE_PLAYLIST_MAX_K_CANDIDATES = _env_positive_int(
 )
 LARGE_PLAYLIST_GMM_N_INIT = _env_positive_int("CLUSTER_LARGE_GMM_N_INIT", 1)
 REFINE_MAX_TRACKS = _env_positive_int("CLUSTER_REFINE_MAX_TRACKS", 600)
+
+
+def normalize_feature_weights(
+    feature_weights: dict[str, float] | None,
+) -> dict[str, float]:
+    """Return bounded feature weights merged with defaults."""
+    if not isinstance(feature_weights, dict):
+        return dict(FEATURE_WEIGHTS)
+
+    normalized = {}
+    for key, default_value in FEATURE_WEIGHTS.items():
+        raw_value = feature_weights.get(key, default_value)
+        try:
+            candidate = float(raw_value)
+        except (TypeError, ValueError):
+            candidate = default_value
+        if not math.isfinite(candidate):
+            candidate = default_value
+        normalized[key] = min(MAX_FEATURE_WEIGHT, max(MIN_FEATURE_WEIGHT, candidate))
+    return normalized
 
 
 def _merge_small_clusters(
@@ -251,7 +274,9 @@ def _refine_cluster_cohesion(
     return refined
 
 
-def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
+def cluster_df(
+    track_audio_features: list[dict], feature_weights: dict[str, float] | None = None
+) -> pd.DataFrame:
     """Return dataframe with track id and assigned GMM clusters."""
     if not track_audio_features:
         return pd.DataFrame(columns=["id", "cluster"])
@@ -278,7 +303,8 @@ def cluster_df(track_audio_features: list[dict]) -> pd.DataFrame:
 
     scaler = StandardScaler()
     scaled = scaler.fit_transform(feature_frame)
-    weights = np.array([FEATURE_WEIGHTS.get(key, 1.0) for key in available_keys])
+    effective_feature_weights = normalize_feature_weights(feature_weights)
+    weights = np.array([effective_feature_weights.get(key, 1.0) for key in available_keys])
     weighted_scaled = scaled * weights
 
     track_count = len(feature_frame)
