@@ -1,71 +1,79 @@
-# Read me
+# Splitify
 
-### Disclaimer
+Splitify is a tool that turns one Spotify playlist into multiple smaller playlists based on musical similarity.
 
-Hi! Thank you for checking out Splitify! I am currently trying to get an extension from Spotify in order to have this fully deployed. If you want to try it out feel free to shoot me an email [stanleygvi@gmail.com] with your Spotify email and I can add you to the authorized users.
+Instead of splitting tracks randomly, Splitify looks at audio traits like energy, mood, danceability, tempo, acousticness, and more, then groups songs that feel like they belong together.
 
-## Description
+## What you can do with Splitify
 
-Splitify is a free to use tool that will split any selected playlist in your library into smaller musically similar playlists.
+- Log in with your Spotify account
+- Choose one or more playlists from your library
+- Pick the kind of split you want, such as `Balanced`, `Energy`, `Mood`, or `Danceability`
+- Fine-tune the audio traits manually if you want more control
+- Generate new playlists automatically from the results
 
-Playlists will be split according to Spotify's audio features provided by their API: https://developer.spotify.com/documentation/web-api/reference/get-audio-features
+## How it works
 
-# Privacy Policy
+1. You sign in with Spotify.
+2. Splitify loads your playlists.
+3. You choose a playlist and select how you want it split.
+4. Splitify analyzes the tracks using Spotify-related audio data.
+5. New playlists are created for each group of similar songs.
 
-At Splitify, we take your privacy and data security seriously. This document explains the specific permissions (scopes) we request from Spotify and why they are necessary to provide the functionality of the Splitify tool.
+Splitify creates new playlists instead of changing your original playlist.
 
-## Spotify Scopes We Use
+## What gets created
 
-### `user-read-private`
+When a playlist is processed, Splitify creates new Spotify playlists for the groups it finds. These groups are based on traits such as:
 
-**Why we need it**:  
-This scope is required to authenticate you with Spotify using OAuth (Spotify's secure login mechanism). It allows us to access basic information about your Spotify account, such as your Spotify user ID, which is necessary for actions like retrieving your playlists or creating new ones. 
+- Energy
+- Mood
+- Danceability
+- Tempo
+- Acousticness
+- Instrumentalness
+- Speechiness
+- Liveness
+- Loudness
 
-**What we access**:  
-- Only your user ID and your playlists.  
-- **We do not access** your subscription type, listening habits, or any other private data beyond what is necessary to identify you as the user.
+Some very small or low-quality groups may be skipped so the final playlists are more useful.
 
-**What we don't do**:  
-- We do not store or use any private information for purposes outside of our service.  
-- We do not share your data with third parties.
+## Spotify permissions
 
-### `playlist-read-private`
+Splitify currently asks for these Spotify permissions:
 
-**Why we need it**:  
-This scope allows us to access both your public and private playlists so that we can retrieve the tracks and process them using the Splitify tool. If you want to split or manage any of your playlists, this permission is necessary to view their contents.
+- `user-read-private`
+- `playlist-read-private`
+- `playlist-modify-public`
+- `playlist-modify-private`
 
-**What we access**:  
-- We access both public and private playlists to read their contents for playlist splitting or processing.  
-- **We do not modify** or change anything in your playlists without your explicit request.
+These permissions are used so Splitify can:
 
-**What we don't do**:  
-- We do not make any unauthorized modifications to your playlists.
-- We do not share your playlist data with any third parties.
+- identify your Spotify account
+- read the playlists you choose
+- create new playlists for the split results
 
-### `playlist-modify-public`
+## Privacy and data use
 
-**Why we need it**:  
-This scope is required to create new public playlists on your behalf when we split your playlists using the Splitify tool. It allows us to add tracks to these newly created playlists and manage them for you.
+Splitify uses your Spotify access only to power the playlist-splitting workflow.
 
-**What we access**:  
-- We only modify public playlists that we create through Splitify.  
-- **We do not modify** any existing playlists
+- Your existing playlists are read so tracks can be analyzed and grouped.
+- Splitify creates new playlists for the output.
+- Your original playlists are not edited by the splitting flow.
 
-**What we don't do**:  
-- We do not add, remove, or change any tracks in your public playlists without your explicit instruction.
-- We do not create or modify any private playlists unless requested in future features.
+## Who this is for
 
-## Your Data, Your Control
+Splitify is useful if you want to:
 
-We request only the permissions that are absolutely necessary to provide the core functionality of Splitify. We do not request access to your email address, personal playlists, or any data unrelated to managing your public or collaborative playlists through our service.
+- break up a long playlist into smaller vibe-based sets
+- separate high-energy songs from calmer ones
+- pull apart mixed playlists into more consistent moods
+- discover natural clusters inside a playlist you already love
 
-We are committed to being transparent about what data we access and ensuring that your data is protected. If you ever have concerns about your privacy or the permissions requested, feel free to reach out to us at [support@splitifytool.com].
+## Summary
 
-Thank you for trusting Splitify with your playlist management!
+Splitify helps you reorganize Spotify playlists into cleaner, more focused listening experiences without manually sorting every track yourself.
 
-## Contact Us
+## Disclaimer
 
-For any questions or concerns about your data and privacy, please contact us:
-
-- Email: [support@splitifytool.com]
-- Website: [https://splitifytool.com]
+Splitify unfortunately cannot be fully public-facing at the moment because of Spotify API access restrictions and app approval requirements. Access may need to remain limited to approved users while those platform restrictions are in place.
